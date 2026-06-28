@@ -506,13 +506,21 @@ cmd_list(){ _wm list; }
 
 cmd_clean(){
   need_repo
-  # 1) close grid windows (their panes were joined, so workmux can't track them -> kill directly)
-  local w
-  while IFS= read -r w; do [ -n "$w" ] && tmux kill-window -t "$w" 2>/dev/null || true; done \
-    < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')
-  # 2) remove all worktrees + their windows
-  echo "wtcp: closing grid windows + removing all worktrees (except main)..."
+  echo "wtcp: removing all worktrees (except main) + closing grid windows..."
+  # 1) Remove worktrees FIRST. cmd_clean is often run from the grid's bottom bar
+  #    pane; step 2 kills that window — which would terminate this script before
+  #    the removal ran (the old "have to run clean twice" bug). Do removal first
+  #    so it always completes even if killing our own window ends the script.
   _wm remove --all -f
+  # 2) Close any leftover grid windows (their joined panes aren't workmux-tracked
+  #    so `remove` can't close them). Kill the window we're in LAST.
+  local w cur; cur=$(tmux display -p '#{window_id}' 2>/dev/null || true)
+  while IFS= read -r w; do
+    [ -n "$w" ] && [ "$w" != "$cur" ] && tmux kill-window -t "$w" 2>/dev/null || true
+  done < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')
+  case "$(tmux display -p '#{window_name}' 2>/dev/null || true)" in
+    "${WIN_PREFIX}:"*) tmux kill-window -t "$cur" 2>/dev/null || true ;;
+  esac
 }
 
 # Short aliases match the in-grid keybinding letters (b=start, s/p/f/x/a/g/r).
