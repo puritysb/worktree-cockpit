@@ -18,7 +18,8 @@
 #
 # IN-GRID KEYS — press your tmux prefix, then:
 #   Ctrl-P pick   ·   Ctrl-X drop   ·   Ctrl-R score-all   ·   Ctrl-S send-all
-#   z = fullscreen the focused agent (z again to return)   ·   arrows = move between agents   ·   [ = scroll
+#   z = fullscreen the focused agent (z again to return)   ·   arrows = move · o = cycle
+#   Ctrl-arrows = resize the focused agent (Alt-arrows = resize bigger steps)   ·   [ = scroll
 #   (Use Ctrl+letter — it passes through the Korean IME. Mouse wheel scrolls; click selects a pane.)
 #
 # You usually only TYPE `wtcp start "..."`; everything else is the in-grid keys above.
@@ -489,7 +490,7 @@ cmd_setup(){
   tmux setw -g mode-keys vi
   echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-R score (ALL agents)"
   echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R judges EVERY agent and shows a popup."
-  echo "  Review: prefix+arrow = move between agents · prefix+z = fullscreen one agent (z again to return)."
+  echo "  Move/resize: prefix+arrow = move (o = cycle) · prefix+z = fullscreen one (z to return) · prefix+Ctrl-arrow = resize."
   echo "  Scroll a pane: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D (vi paging), q to exit. Diffs: workmux dashboard 'd'."
 }
 
