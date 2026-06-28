@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# wtcp — Worktree Cockpit: run several coding agents on one prompt in an isolated
+# tmux grid, then review, score, and merge the best (workmux + tmux + git).
+# Invoke as `wtcp <cmd>`. Short aliases shown in ().
+#
+#   wtcp start|b "<prompt>" [name]   Broadcast a prompt to every agent: a grid on top + command bar below
+#   wtcp send|s "<text>"             Send a follow-up instruction to every agent in the grid
+#   wtcp pick|p                      Focused pane = winner -> (auto-commit) merge to main + clean up the rest
+#   wtcp fork|f "<prompt>"           Branch a new round from the focused pane's WIP (no merge to main)
+#   wtcp drop|x                      Remove just the focused pane; the grid re-tiles (survivors grow)
+#   wtcp abandon|a                   Discard the current grid without merging (review-only round)
+#   wtcp score|r                     Judge each agent with an LLM endpoint: ★score on the border + a "why" popup
+#   wtcp grid|g                      Jump to the active grid window
+#   wtcp agents [names...]           Show or set the agent set compared by `wtcp start`
+#   wtcp list|ls | clean|clear       List worktrees / remove all compare worktrees + grid windows
+#
+# Agent set: managed via `wtcp agents`; default claude codex opencode.
+# Config:   ~/.config/wtcp/config (sourced; sets COCKPIT_AGENTS, COCKPIT_JUDGE_URL, ...).
+# Most operations are in-grid keybindings (prefix + S/P/F/X/G/R), so the only
+# command you usually type is `wtcp start "..."`.
+set -euo pipefail
+
+# Load user config (agent set, endpoints, COCKPIT_TRUST, ...) before defaults.
+WTCP_CONFIG="${WTCP_CONFIG:-$HOME/.config/wtcp/config}"
+# shellcheck disable=SC1090
+[ -f "$WTCP_CONFIG" ] && . "$WTCP_CONFIG" || true
+
+: "${COCKPIT_AGENTS:=claude codex opencode}"
+# Agents that workmux can't prompt-inject and that need wtcp to send the prompt
+# via tmux send-keys. agy no longer needs this (it launches via a wrapper that
+# loads the prompt itself), so this is empty by default.
+: "${COCKPIT_SENDKEYS_AGENTS:=}"
+: "${COCKPIT_SEND_DELAY:=0.4}"        # delay between paste and Enter (avoids codex submit race)
+: "${COCKPIT_AGY_DELAY:=4}"           # wait before send-keys-delivering to a non-builtin agent
+# OPT-IN: 1 = launch agents with their folder-trust/permission/sandbox bypass
+# flags so a brand-new project auto-starts. This disarms approval/sandbox gates
+# (the agents auto-approve all tool use) and edits the global workmux config, so
+# it is OFF by default — set COCKPIT_TRUST=1 explicitly to enable.
+: "${COCKPIT_TRUST:=0}"
+WIN_PREFIX="wt"
+BAR_HEIGHT=6
+# Always-visible shortcut cheatsheet (shown on the command-bar pane border).
+# Use Ctrl + the letter; the Ctrl variant passes through the Korean IME.
+BAR_KEYS='wtcp (prefix, then)   Ctrl-P pick · Ctrl-X drop · Ctrl-S send-all · Ctrl-R score-ALL      |      z = fullscreen one · arrows = move · [ = scroll'
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# Path the keybindings call back through. Prefer `wtcp` on PATH; fall back to this
+# script's absolute path. COCKPIT_INVOKE overrides (e.g. a wrapper command).
+INVOKE="${COCKPIT_INVOKE:-$(command -v wtcp || echo "$SELF")}"
+
+die(){ echo "wtcp: $*" >&2; exit 1; }
+need_tmux(){ [ -n "${TMUX:-}" ] || die "run inside a tmux session"; }
+need_repo(){ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run inside a git repository"; }
+goto_root(){ local r; r=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true); [ -n "$r" ] && cd "$r" || true; }
+pane_wt(){ tmux show-options -pqv -t "$1" @worktree 2>/dev/null || true; }
+# Type the prompt into a pane and submit it. codex leaves the text in the input
+# box if Enter arrives right after the paste, so we delay between the two
+# (harmless for claude/opencode).
+_send_to_pane(){
+  tmux send-keys -t "$1" -l -- "$2"
+  sleep "$COCKPIT_SEND_DELAY"
+  tmux send-keys -t "$1" Enter
+}
+# Absolute worktree path (workmux path -> fallback to <repo>__worktrees/<wt>).
+_wt_path(){
+  local p root; p=$(workmux path "$1" 2>/dev/null || true)
+  if [ -z "$p" ] || [ ! -d "$p" ]; then
+    root=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true)
+    [ -n "$root" ] && p="$(dirname "$root")/$(basename "$root")__worktrees/$1"
+  fi
+  # Must return 0 even when not found: callers use `path=$(_wt_path ...)` and a
+  # non-zero status there aborts the whole script under `set -e` (was the cause
+  # of `wtcp score` exiting 1 when a pane's worktree path couldn't be resolved).
+  if [ -d "$p" ]; then printf '%s' "$p"; fi
+  return 0
+}
+# Keep only [a-z0-9-] for a git-safe kebab name (stdin or $1). Capped at 28 chars.
+_sanitize_slug(){
+  local s="${1-$(cat)}"
+  printf '%s' "$s" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' \
+    | sed -E 's/-+/-/g; s/^-+//; s/-+$//' | cut -c1-28 | sed -E 's/-+$//'
+}
+# Prompt (any language) -> short english kebab branch name.
+#   COCKPIT_NAMER: fm (Apple Intelligence, default, on-device) | mlx (local Qwen3.6) | off.
+#   fm falls back to mlx, then to the prompt's ASCII letters.
+: "${COCKPIT_NAMER:=fm}"
+: "${COCKPIT_NAMER_URL:=http://localhost:8800/v1/chat/completions}"
+# FM helper default: relative to this script (resolving symlinks), assets/fm-helper/...
+_self_dir(){
+  local s="$SELF"
+  [ -L "$s" ] && s="$(readlink "$s")"
+  case "$s" in /*) ;; *) s="$(cd "$(dirname "$SELF")" && pwd)/$s";; esac
+  (cd "$(dirname "$s")" && pwd)
+}
+: "${COCKPIT_FM_HELPER:=$(_self_dir)/assets/fm-helper/wtcp-fm-helper}"
+# Optional warm Apple-Intelligence endpoint (AgentDeck daemon, if running):
+# COCKPIT_DAEMON_PORT -> ~/.agentdeck/daemon.json httpPort -> 9120. Best-effort;
+# if nothing is listening, naming falls back to the FM binary, then MLX.
+: "${COCKPIT_DAEMON_PORT:=}"
+if [ -z "${COCKPIT_DAEMON_URL:-}" ]; then
+  _p="${COCKPIT_DAEMON_PORT:-}"
+  [ -n "$_p" ] || _p=$(jq -r '.httpPort // .port // empty' "$HOME/.agentdeck/daemon.json" 2>/dev/null || true)
+  [ -n "$_p" ] || _p=9120
+  COCKPIT_DAEMON_URL="http://127.0.0.1:$_p"
+fi
+_NAME_INSTR='Output ONLY a short lowercase kebab-case english git branch name, max 3 words, only a-z 0-9 and hyphens, no quotes, no explanation, no slashes, summarizing this task: '
+_FM_SYS='You output only a short kebab-case git branch name and nothing else.'
+_name_fm(){   # Apple Intelligence (FoundationModels)
+  local out
+  # 1) prefer the warm daemon helper — it's resident, so no ~7s cold start
+  out=$(curl -s --max-time 12 "$COCKPIT_DAEMON_URL/generate" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg p "$_NAME_INSTR$1" --arg s "$_FM_SYS" '{prompt:$p,instructions:$s}')" \
+        2>/dev/null | jq -r '.text // empty' 2>/dev/null || true)
+  [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  # 2) fallback: invoke the helper binary directly (cold start)
+  [ -x "$COCKPIT_FM_HELPER" ] || return 0
+  jq -nc --arg p "$_NAME_INSTR$1" --arg s "$_FM_SYS" '{id:1,prompt:$p,instructions:$s,temperature:0.2}' \
+    | "$COCKPIT_FM_HELPER" 2>/dev/null | head -1 | jq -r '.text // empty' 2>/dev/null || true
+}
+_name_mlx(){
+  curl -s --max-time 8 "$COCKPIT_NAMER_URL" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg p "$_NAME_INSTR$1" '{messages:[{role:"user",content:$p}],max_tokens:20,temperature:0.2}')" \
+    2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true
+}
+slugify(){
+  local prompt="$1" out=""
+  case "$COCKPIT_NAMER" in
+    fm)  out=$(_sanitize_slug "$(_name_fm "$prompt")"); [ -n "$out" ] || out=$(_sanitize_slug "$(_name_mlx "$prompt")");;
+    mlx) out=$(_sanitize_slug "$(_name_mlx "$prompt")");;
+    *)   out="";;
+  esac
+  [ -n "$out" ] || out=$(printf '%s' "$prompt" | _sanitize_slug)   # fallback: ASCII letters of the prompt
+  [ -n "$out" ] && printf '%s' "$out" || printf 'task-%s' "$(date +%H%M%S)"
+}
+
+# Set/replace an agent's command in the workmux global agents map (idempotent).
+# (workmux honors overrides of builtin names and appends the prompt as -- "...".)
+_set_agent_cfg(){
+  local CFG="$HOME/.config/workmux/config.yaml" agent="$1" cmd="$2" line
+  mkdir -p "$(dirname "$CFG")"; [ -f "$CFG" ] || printf 'nerdfont: true\n' > "$CFG"
+  line="  $agent: \"$cmd\""
+  if grep -qE "^[[:space:]]*$agent:" "$CFG"; then
+    awk -v a="$agent" -v w="$line" 'index($0,a":") && $0 ~ "^[[:space:]]*"a":" {print w; next} {print}' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+  elif grep -qE '^agents:' "$CFG"; then
+    awk -v w="$line" '/^agents:/&&!d{print;print w;d=1;next}{print}' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+  else
+    printf '\nagents:\n%s\n' "$line" >> "$CFG"
+  fi
+}
+
+# Configure the agents in the set so a round launches cleanly:
+#  - agy: a wrapper that loads the prompt from .workmux/PROMPT-*.md (it can't take
+#    workmux's `-- "..."` form) and runs `agy -i`.
+#  - claude/codex: when COCKPIT_TRUST=1, launch with their folder-trust/permission
+#    bypass flags so a brand-new project auto-starts instead of stopping at "Do
+#    you trust this folder?". workmux still appends the prompt.
+#  - opencode: left as the builtin (no trust prompt).
+# Note: this edits the workmux GLOBAL config, so it also affects plain `workmux
+# -a claude/codex`. Set COCKPIT_TRUST=0 (default) to keep the safety prompts.
+_ensure_agent_configs(){
+  local a flag=""
+  [ "${COCKPIT_TRUST:-0}" = 1 ] && flag="--dangerously-skip-permissions "
+  for a in $COCKPIT_AGENTS; do case "$a" in
+    agy)
+      local W="$HOME/.config/wtcp/agy-wm"; mkdir -p "$(dirname "$W")"
+      printf '#!/bin/sh\np=$(cat .workmux/PROMPT-*.md 2>/dev/null)\nexec agy %s-i "$p"\n' "$flag" > "$W"; chmod +x "$W"
+      _set_agent_cfg agy "$W" ;;
+    claude) [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg claude "claude --dangerously-skip-permissions" ;;
+    codex)  [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg codex "codex --dangerously-bypass-approvals-and-sandbox" ;;
+  esac; done
+}
+
+# One round: branch N agents from base (empty base = current main) + broadcast prompt + assemble grid.
+_run_round(){
+  local prompt="$1" task="$2" base="${3:-}"
+  _ensure_agent_configs   # agy wrapper + (COCKPIT_TRUST) folder-trust bypass for claude/codex
+  local root; root=$(git rev-parse --show-toplevel)
+  local addargs=(); for a in $COCKPIT_AGENTS; do addargs+=(-a "$a"); done
+  [ -n "$base" ] && addargs+=(--base "$base")
+
+  local before after
+  before=$(tmux list-windows -F '#{window_id}' | sort)
+  echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
+  workmux add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null
+  sleep 1
+  after=$(tmux list-windows -F '#{window_id}' | sort)
+  local neww; neww=$(comm -13 <(echo "$before") <(echo "$after") || true)
+  [ -n "$neww" ] || die "no new worktree windows found (workmux add failed?)"
+
+  # Grid window: pull each agent pane in with join-pane (pane_id is stable across the move).
+  local cwin ph
+  cwin=$(tmux new-window -d -P -F '#{window_id}' -n "${WIN_PREFIX}:${task}")
+  ph=$(tmux list-panes -t "$cwin" -F '#{pane_id}' | head -1)
+  tmux set-option -w -t "$cwin" @cockpit_root "$root"
+  tmux set-option -w -t "$cwin" @cockpit_prompt "$prompt"   # used as the pick auto-commit message
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    local wt src
+    # workmux puts a nerd-font branch icon + space in the window name when
+    # nerdfont is on. Strip everything up to the last space so @worktree is the
+    # clean branch name (else workmux path/remove/diff all miss).
+    wt=$(tmux display-message -p -t "$w" '#{window_name}'); wt="${wt##* }"
+    src=$(tmux list-panes -t "$w" -F '#{pane_id}' | head -1)
+    tmux join-pane -d -s "$src" -t "$cwin"
+    tmux set-option -p -t "$src" @worktree "$wt"
+    tmux set-option -p -t "$src" @pane_label "$wt"
+  done <<< "$neww"
+  tmux kill-pane -t "$ph" 2>/dev/null || true
+  tmux select-layout -t "$cwin" tiled
+  # Full-width bottom command bar (grid compresses above it; it survives drops).
+  local bar
+  bar=$(tmux split-window -d -f -v -l "$BAR_HEIGHT" -t "$cwin" -P -F '#{pane_id}' \
+        "printf '%s\n' '-- wtcp -- shortcut keys are on the pane borders above. Follow-up to all: wtcp send \"...\"'; exec \${SHELL:-/bin/zsh}")
+  tmux set-option -p -t "$bar" @cockpit_bar 1
+  # Always-visible cheatsheet: pane-border line shows the keys on the bar and the
+  # worktree name on each agent pane (score later augments these with ★ scores).
+  tmux set-window-option -t "$cwin" pane-border-status top
+  tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
+  tmux set-option -p -t "$bar" @pane_label "$BAR_KEYS"
+  # Non-builtin agents (agy, etc.) aren't prompt-injected by workmux -p -> deliver via send-keys.
+  local sa p wt
+  for sa in $COCKPIT_SENDKEYS_AGENTS; do
+    while IFS=' ' read -r p wt; do
+      case "$wt" in *-"$sa") sleep "$COCKPIT_AGY_DELAY"; _send_to_pane "$p" "$prompt";; esac
+    done < <(tmux list-panes -t "$cwin" -F '#{pane_id} #{@worktree}')
+  done
+  tmux select-pane -t "$bar"
+  tmux select-window -t "$cwin"
+  echo "wtcp: grid ready."
+}
+
+# True if any `<task>-<agent>` branch already exists (collision).
+_task_collides(){
+  local a
+  for a in $COCKPIT_AGENTS; do
+    git show-ref --verify --quiet "refs/heads/$1-$a" && return 0
+  done
+  return 1
+}
+# Next free name by appending -2, -3, ... until no collision.
+_free_task(){
+  local base="$1" t="$1" i=1
+  while _task_collides "$t"; do i=$((i+1)); t="$base-$i"; done
+  printf '%s' "$t"
+}
+# Remove the existing `<task>-<agent>` worktrees so the name can be reused.
+_clean_task(){
+  local a
+  for a in $COCKPIT_AGENTS; do workmux remove "$1-$a" -f 2>/dev/null || true; done
+}
+# On collision, ask the user what to do. Sets global RESOLVED_TASK (or aborts).
+# Defaults to auto-rename when there's no TTY (non-interactive).
+_resolve_task(){
+  RESOLVED_TASK="$1"
+  _task_collides "$1" || return 0
+  printf "wtcp: worktrees for '%s-*' already exist.\n  [n] new auto-named name  ·  [c] clean existing & reuse  ·  [a] abort? [n/c/a] " "$1" >&2
+  local ans=""; read -r ans </dev/tty 2>/dev/null || ans=n
+  case "$ans" in
+    c|C) _clean_task "$1"; echo "wtcp: cleaned existing, reusing '$1'" >&2;;
+    a|A) die "aborted";;
+    *)   RESOLVED_TASK=$(_free_task "$1"); echo "wtcp: name in use -> using '$RESOLVED_TASK'" >&2;;
+  esac
+}
+
+cmd_broadcast(){
+  need_tmux; need_repo
+  local prompt="${1:-}"; [ -n "$prompt" ] || die 'start "<prompt>" [name]'
+  local task="${2:-}"; [ -n "$task" ] || task=$(slugify "$prompt"); [ -n "$task" ] || task="t$(date +%H%M%S)"
+  _resolve_task "$task"; task="$RESOLVED_TASK"
+  _run_round "$prompt" "$task" ""
+}
+
+# Branch a new round from the focused agent's (unmerged) WIP. No merge to main.
+cmd_fork(){
+  need_tmux; need_repo
+  local prompt="${1:-}"; [ -n "$prompt" ] || die 'fork "<prompt>" [name]'
+  local fp wt; fp=$(tmux display -p '#{pane_id}'); wt=$(pane_wt "$fp")
+  [ -n "$wt" ] || die "put the cursor on the agent pane to fork from (not the bar/empty pane)"
+  goto_root
+  local wpath; wpath=$(workmux path "$wt" 2>/dev/null || true)
+  if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
+    echo "wtcp: committing [$wt] WIP (pinning the fork base)..."
+    git -C "$wpath" add -A && git -C "$wpath" commit -q -m "wip: fork base from $wt" || true
+  fi
+  local task; task=$(slugify "$prompt"); [ -n "$task" ] || task="t$(date +%H%M%S)"
+  _resolve_task "$task"; task="$RESOLVED_TASK"
+  echo "wtcp: forking from [$wt] -> new round"
+  _run_round "$prompt" "$task" "$wt"
+}
+
+# Discard the current grid (review-only round, no merge). Removes worktrees + closes window.
+cmd_abandon(){
+  need_tmux
+  local cwin; cwin=$(tmux display -p '#{window_id}')
+  goto_root
+  local p wt
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p"); [ -n "$wt" ] && (workmux remove "$wt" -f || true)
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  tmux kill-window -t "$cwin" 2>/dev/null || true
+  echo "wtcp: grid abandoned (nothing merged)."
+}
+
+# ===== Built-in judge =====
+# Calls an LLM endpoint (OpenAI-compatible; local Qwen via MLX by default) to
+# score each agent's work and explain why, on demand, from the diff + the agent's
+# recent output. COCKPIT_JUDGE_URL overrides the endpoint.
+: "${COCKPIT_JUDGE_URL:=http://localhost:8800/v1/chat/completions}"
+
+_wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files), capped
+  local path="$1" base f
+  base=main; git -C "$path" rev-parse --verify -q main >/dev/null 2>&1 || base=master
+  {
+    git -C "$path" diff "$base" 2>/dev/null
+    for f in $(git -C "$path" ls-files --others --exclude-standard 2>/dev/null); do
+      printf '\n--- new file: %s ---\n' "$f"; git -C "$path" diff --no-index -- /dev/null "$path/$f" 2>/dev/null
+    done
+  } | head -c 6000
+}
+
+_judge_one(){   # $1=path $2=task prompt $3=pane_id -> "score|reason"
+  local path="$1" prompt="$2" pane="$3" diff out req resp score reason
+  [ -n "$path" ] && diff=$(_wt_diff "$path") || diff=""
+  out=$(tmux capture-pane -p -S -120 -t "$pane" 2>/dev/null | tail -100 | head -c 4000)
+  req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" \
+    '{messages:[{role:"user",content:("You are a strict reviewer. Rate 0-10 how well the agent accomplished the task. If it made code changes (see Diff), judge their correctness, completeness and quality. If there are no code changes (a conversational, research, or analysis task), judge the correctness and quality of its response in Output instead — do NOT penalize for an empty diff in that case. Return STRICT JSON only: {\"score\":N,\"reason\":\"one short sentence\"}.\nTask: " + $t + "\n\nDiff (may be empty):\n" + $d + "\n\nAgent output:\n" + $o)}],max_tokens:160,temperature:0.2}')
+  resp=$(curl -s --max-time 45 "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+  score=$(printf '%s' "$resp" | jq -r '.score // empty' 2>/dev/null || true)
+  reason=$(printf '%s' "$resp" | jq -r '.reason // empty' 2>/dev/null || true)
+  if [ -z "$score" ]; then   # model wrapped JSON in prose — extract best-effort
+    score=$(printf '%s' "$resp" | grep -oE '"score"[: ]*[0-9.]+' | grep -oE '[0-9.]+' | head -1)
+    reason=$(printf '%s' "$resp" | sed -n 's/.*"reason"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+  fi
+  printf '%s|%s' "${score:-?}" "${reason:-(no judgment — is the judge LLM running?)}"
+}
+
+# Score every agent in the grid with the judge: ★score on each pane border + a
+# dismissable popup explaining why. Takes a few seconds per agent.
+cmd_score(){
+  need_tmux; goto_root
+  local cwin prompt; cwin=$(tmux display -p '#{window_id}')
+  prompt=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true)
+  tmux set-window-option -t "$cwin" pane-border-status top
+  tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
+  local p wt path res sc reason summary=""
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p")
+    if [ -z "$wt" ]; then tmux set-option -p -t "$p" @pane_label "$BAR_KEYS"; continue; fi
+    tmux set-option -p -t "$p" @pane_label "$wt   judging..."
+    path=$(_wt_path "$wt")
+    res=$(_judge_one "$path" "$prompt" "$p"); sc="${res%%|*}"; reason="${res#*|}"
+    tmux set-option -p -t "$p" @pane_label "$wt   ★ $sc"
+    tmux set-option -p -t "$p" @judge_reason "$reason"
+    summary="${summary}★ ${sc}   ${wt}\n    ${reason}\n\n"
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
+  { printf 'Task: %s\n\n' "${prompt:-(unknown)}"; printf '%b' "$summary"; } > "$F" 2>/dev/null || true
+  tmux display-popup -E -w 82% -h 60% "${PAGER:-less} '$F'" 2>/dev/null || true
+}
+
+# Show or set the agent set compared by `wtcp start` (persists to ~/.config/wtcp/config).
+cmd_agents(){
+  if [ "$#" -eq 0 ]; then echo "$COCKPIT_AGENTS"; return 0; fi
+  mkdir -p "$(dirname "$WTCP_CONFIG")"
+  local val="$*"
+  if [ -f "$WTCP_CONFIG" ] && grep -q '^COCKPIT_AGENTS=' "$WTCP_CONFIG"; then
+    awk -v v="COCKPIT_AGENTS=\"$val\"" '/^COCKPIT_AGENTS=/{print v;next}{print}' "$WTCP_CONFIG" > "$WTCP_CONFIG.tmp" && mv "$WTCP_CONFIG.tmp" "$WTCP_CONFIG"
+  else
+    printf 'COCKPIT_AGENTS="%s"\n' "$val" >> "$WTCP_CONFIG"
+  fi
+  COCKPIT_AGENTS="$val"
+  echo "wtcp: compare set -> $val"
+  _ensure_agent_configs
+}
+
+cmd_send(){
+  need_tmux
+  local text="${1:-}"; [ -n "$text" ] || die 'send "<text>"'
+  local cwin; cwin=$(tmux display -p '#{window_id}')
+  local n=0 p wt
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p"); [ -n "$wt" ] || continue          # skip the bar/empty pane
+    _send_to_pane "$p" "$text"
+    echo "-> $wt"; n=$((n+1))
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  echo "wtcp: sent to $n agent(s)"
+}
+
+cmd_pick(){
+  need_tmux
+  local cwin fp winner; cwin=$(tmux display -p '#{window_id}'); fp=$(tmux display -p '#{pane_id}')
+  winner=$(pane_wt "$fp"); [ -n "$winner" ] || die "put the cursor on the winning agent pane (not the bar/empty pane)"
+  local losers=() p wt
+  while IFS= read -r p; do
+    [ "$p" = "$fp" ] && continue
+    wt=$(pane_wt "$p"); [ -n "$wt" ] && losers+=("$wt")
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  goto_root
+  # Auto-commit the winner's uncommitted changes (workmux merge only takes commits -> else work is lost).
+  local wpath; wpath=$(workmux path "$winner" 2>/dev/null || true)
+  if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
+    local msg; msg=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
+    echo "wtcp: auto-committing the winner's uncommitted changes..."
+    git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" || true
+  fi
+  echo "wtcp: winner [$winner] -> merge to main / cleanup: ${losers[*]:-(none)}"
+  workmux merge "$winner" || die "merge failed (resolve conflicts)"
+  local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (workmux remove "$l" -f || true); done
+  tmux kill-window -t "$cwin" 2>/dev/null || true
+  echo "wtcp: done. merged to main — keep working or start another round."
+}
+
+cmd_drop(){
+  need_tmux
+  local fp wt; fp=$(tmux display -p '#{pane_id}'); wt=$(pane_wt "$fp")
+  [ -n "$wt" ] || die "put the cursor on the agent pane to drop (not the bar/empty pane)"
+  goto_root
+  echo "wtcp: dropping [$wt] (remove worktree + close pane, grid re-tiles)"
+  workmux remove "$wt" -f || true
+  tmux kill-pane -t "$fp" 2>/dev/null || true     # only the top grid re-flows; the bottom bar stays
+}
+
+cmd_setup(){
+  need_tmux
+  # Bind each verb to BOTH the bare uppercase letter and Ctrl+lowercase. The
+  # Ctrl+letter variant passes through the Korean IME (the bare letters get
+  # composed into Hangul), so prefix -> C-p etc. work without switching input.
+  local k
+  for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE pick"; done
+  for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE drop"; done
+  for k in R C-r; do tmux bind-key "$k" run-shell "$INVOKE score"; done
+  for k in S C-s; do tmux bind-key "$k" command-prompt -p 'send-all:' "run-shell \"$INVOKE send '%%'\""; done
+  # Make the small grid panes reviewable: mouse-wheel scroll + vi paging
+  # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
+  tmux set -g mouse on
+  tmux setw -g mode-keys vi
+  echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-R score (ALL agents)"
+  echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R judges EVERY agent and shows a popup."
+  echo "  Review: prefix+arrow = move between agents · prefix+z = fullscreen one agent (z again to return)."
+  echo "  Scroll a pane: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D (vi paging), q to exit. Diffs: workmux dashboard 'd'."
+}
+
+# Jump to the active grid window (overlay-like "button"). Most recent one.
+cmd_grid(){
+  need_tmux
+  local w; w=$(tmux list-windows -F '#{window_id} #{window_name}' | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}' | tail -1)
+  [ -n "$w" ] || die "no active grid (run 'wtcp start' first)"
+  tmux select-window -t "$w"
+}
+
+cmd_list(){ workmux list; }
+
+cmd_clean(){
+  need_repo
+  # 1) close grid windows (their panes were joined, so workmux can't track them -> kill directly)
+  local w
+  while IFS= read -r w; do [ -n "$w" ] && tmux kill-window -t "$w" 2>/dev/null || true; done \
+    < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')
+  # 2) remove all worktrees + their windows
+  echo "wtcp: closing grid windows + removing all worktrees (except main)..."
+  workmux remove --all -f
+}
+
+# Short aliases match the in-grid keybinding letters (b=start, s/p/f/x/a/g/r).
+case "${1:-}" in
+  start|broadcast|b) shift; cmd_broadcast "$@";;
+  send|s)            shift; cmd_send "$@";;
+  pick|p)            shift; cmd_pick "$@";;
+  fork|f)            shift; cmd_fork "$@";;
+  drop|x)            shift; cmd_drop "$@";;
+  abandon|a)         shift; cmd_abandon "$@";;
+  grid|g)            shift; cmd_grid "$@";;
+  score|r)           shift; cmd_score "$@";;
+  agents)            shift; cmd_agents "$@";;
+  setup)             shift; cmd_setup "$@";;
+  list|ls)           shift; cmd_list "$@";;
+  clean|clear)       shift; cmd_clean "$@";;
+  ""|-h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$SELF";;
+  *) die "unknown command: $1 (try: wtcp help)";;
+esac

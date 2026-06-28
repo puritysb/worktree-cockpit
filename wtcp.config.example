@@ -1,0 +1,22 @@
+# wtcp config — copy to ~/.config/wtcp/config and edit. Everything is optional;
+# defaults are shown. `wtcp agents ...` writes COCKPIT_AGENTS here for you.
+
+# Agents compared by `wtcp start` (space-separated). Builtin workmux agents:
+# claude codex opencode gemini. Others (e.g. agy) are auto-configured by wtcp.
+COCKPIT_AGENTS="claude codex opencode"
+
+# LLM judge endpoint (OpenAI-compatible /chat/completions) used by `wtcp score`.
+# Point at a local MLX/Ollama server, OpenAI, or any compatible endpoint.
+COCKPIT_JUDGE_URL="http://localhost:8800/v1/chat/completions"
+
+# Branch-name generator from the prompt: fm (Apple Intelligence, macOS, on-device)
+# | mlx (local Qwen via COCKPIT_NAMER_URL) | off (ASCII slug of the prompt).
+COCKPIT_NAMER="fm"
+COCKPIT_NAMER_URL="http://localhost:8800/v1/chat/completions"
+
+# OPT-IN. 1 = launch agents with their folder-trust/permission/sandbox bypass
+# flags so a brand-new project auto-starts instead of stopping at "Do you trust
+# this folder?". This disarms the agents' approval/sandbox gates (they auto-
+# approve all tool use) AND edits the global workmux config, so it is OFF by
+# default. Enable only for repos you trust.
+COCKPIT_TRUST=0

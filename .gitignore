@@ -1,0 +1,4 @@
+# Built (arch-specific) FM helper binary — rebuilt by install.sh / build-fm-helper.mjs
+assets/fm-helper/wtcp-fm-helper
+*.tmp
+.DS_Store
