@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # wtcp — Worktree Cockpit: run several coding agents on one prompt in an isolated
 # tmux grid, then review, score, and merge the best (workmux + tmux + git).
-# Invoke as `wtcp <cmd>`. Short aliases shown in ().
 #
-#   wtcp start|b "<prompt>" [name]   Broadcast a prompt to every agent: a grid on top + command bar below
-#   wtcp send|s "<text>"             Send a follow-up instruction to every agent in the grid
-#   wtcp pick|p                      Focused pane = winner -> (auto-commit) merge to main + clean up the rest
-#   wtcp fork|f "<prompt>"           Branch a new round from the focused pane's WIP (no merge to main)
-#   wtcp drop|x                      Remove just the focused pane; the grid re-tiles (survivors grow)
-#   wtcp abandon|a                   Discard the current grid without merging (review-only round)
-#   wtcp score|r                     Judge each agent with an LLM endpoint: ★score on the border + a "why" popup
-#   wtcp grid|g                      Jump to the active grid window
-#   wtcp agents [names...]           Show or set the agent set compared by `wtcp start`
-#   wtcp list|ls | clean|clear       List worktrees / remove all compare worktrees + grid windows
+# COMMANDS                              alias   in-grid key   what it does
+#   wtcp start "<prompt>" [name]        b                     start a round: broadcast to every agent + build the grid
+#   wtcp score                          r       prefix Ctrl-R judge every agent with an LLM (★ on borders + "why" popup)
+#   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into main (auto-commit), drop the rest
+#   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
+#   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
+#   wtcp fork "<prompt>"                f                     start a new round from the focused agent's WIP (no merge)
+#   wtcp abandon                        a                     discard the whole grid, merge nothing
+#   wtcp grid                           g                     jump to the grid window
+#   wtcp agents [names...]                                    show / set the agents compared (default: claude codex opencode)
+#   wtcp list                           ls                    list active worktrees
+#   wtcp clean                          clear                 remove ALL compare worktrees + close grid windows
+#   wtcp setup                                                (re)install the in-grid keys + mouse (auto-run by `start`)
 #
-# Agent set: managed via `wtcp agents`; default claude codex opencode.
-# Config:   ~/.config/wtcp/config (sourced; sets COCKPIT_AGENTS, COCKPIT_JUDGE_URL, ...).
-# Most operations are in-grid keybindings (prefix + S/P/F/X/G/R), so the only
-# command you usually type is `wtcp start "..."`.
+# IN-GRID KEYS — press your tmux prefix, then:
+#   Ctrl-P pick   ·   Ctrl-X drop   ·   Ctrl-R score-all   ·   Ctrl-S send-all
+#   z = fullscreen the focused agent (z again to return)   ·   arrows = move between agents   ·   [ = scroll
+#   (Use Ctrl+letter — it passes through the Korean IME. Mouse wheel scrolls; click selects a pane.)
+#
+# You usually only TYPE `wtcp start "..."`; everything else is the in-grid keys above.
+# Config: ~/.config/wtcp/config  (COCKPIT_AGENTS, COCKPIT_JUDGE_URL, COCKPIT_TRUST, ...).
 set -euo pipefail
 
 # Load user config (agent set, endpoints, COCKPIT_TRUST, ...) before defaults.
