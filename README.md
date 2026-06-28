@@ -63,9 +63,13 @@ $EDITOR ~/.config/wtcp/config        # set COCKPIT_JUDGE_URL at minimum
 | **Ollama** (local, free) | `http://localhost:11434/v1/chat/completions` | `ollama pull qwen2.5-coder` first |
 | **LM Studio** (local) | `http://localhost:1234/v1/chat/completions` | start its local server |
 | **MLX** (local, Apple Silicon) | `http://localhost:8800/v1/chat/completions` | `mlx_lm.server` |
-| **OpenAI** | `https://api.openai.com/v1/chat/completions` | also export `OPENAI_API_KEY`-style auth in the request (edit the script if you need an `Authorization` header) |
+| **OpenAI** | `https://api.openai.com/v1/chat/completions` | set `COCKPIT_JUDGE_AUTH="Bearer sk-..."` |
 
-A local model (Ollama/LM Studio/MLX) is the easiest start — no keys, runs offline.
+For hosted endpoints that need an API key, set `COCKPIT_JUDGE_AUTH` to the full
+`Authorization` header value (e.g. `Bearer sk-...`); the namer reuses it. Local
+servers (Ollama/LM Studio/MLX) need no key and are the easiest start — offline,
+no keys.
+
 If `wtcp score` shows *"no judgment — is the judge LLM running?"*, the endpoint
 isn't reachable: check the URL and that the server is up.
 
@@ -114,7 +118,8 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `COCKPIT_AGENTS` | `claude codex opencode` | agents compared by `wtcp start` |
-| `COCKPIT_JUDGE_URL` | `localhost:8800/v1/chat/completions` | LLM endpoint for `wtcp score` |
+| `COCKPIT_JUDGE_URL` | `localhost:11434/v1/chat/completions` | LLM endpoint for `wtcp score` |
+| `COCKPIT_JUDGE_AUTH` | _(empty)_ | `Authorization` header value for hosted endpoints, e.g. `Bearer sk-...` (namer reuses it) |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
 | `COCKPIT_TRUST` | `0` | **opt-in**: launch agents with trust/permission bypass so new projects auto-start (disarms approval/sandbox gates; edits the global workmux config) |
 

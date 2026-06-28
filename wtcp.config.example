@@ -13,6 +13,11 @@ COCKPIT_AGENTS="claude codex opencode"
 # Or a hosted endpoint, e.g. https://api.openai.com/v1/chat/completions
 COCKPIT_JUDGE_URL="http://localhost:11434/v1/chat/completions"
 
+# Authorization header for hosted endpoints that need an API key (the namer
+# reuses it). Leave empty for local servers. Example:
+# COCKPIT_JUDGE_AUTH="Bearer sk-..."
+COCKPIT_JUDGE_AUTH=""
+
 # Branch-name generator from the prompt: fm (Apple Intelligence, macOS, on-device)
 # | mlx (local LLM via COCKPIT_NAMER_URL) | off (ASCII slug of the prompt).
 COCKPIT_NAMER="fm"

@@ -83,7 +83,12 @@ _sanitize_slug(){
 #   COCKPIT_NAMER: fm (Apple Intelligence, default, on-device) | mlx (local Qwen3.6) | off.
 #   fm falls back to mlx, then to the prompt's ASCII letters.
 : "${COCKPIT_NAMER:=fm}"
-: "${COCKPIT_NAMER_URL:=http://localhost:8800/v1/chat/completions}"
+: "${COCKPIT_NAMER_URL:=http://localhost:11434/v1/chat/completions}"
+# Authorization header VALUE for hosted endpoints, e.g. "Bearer sk-...". Empty =
+# no header (local servers like Ollama/MLX/LM Studio need none). NAMER inherits
+# JUDGE's value by default, so setting COCKPIT_JUDGE_AUTH alone covers both.
+: "${COCKPIT_JUDGE_AUTH:=}"
+: "${COCKPIT_NAMER_AUTH:=${COCKPIT_JUDGE_AUTH}}"
 # FM helper default: relative to this script (resolving symlinks), assets/fm-helper/...
 _self_dir(){
   local s="$SELF"
@@ -117,7 +122,8 @@ _name_fm(){   # Apple Intelligence (FoundationModels)
     | "$COCKPIT_FM_HELPER" 2>/dev/null | head -1 | jq -r '.text // empty' 2>/dev/null || true
 }
 _name_mlx(){
-  curl -s --max-time 8 "$COCKPIT_NAMER_URL" -H 'Content-Type: application/json' \
+  local hdr=(); [ -n "${COCKPIT_NAMER_AUTH:-}" ] && hdr+=(-H "Authorization: $COCKPIT_NAMER_AUTH")
+  curl -s --max-time 8 "$COCKPIT_NAMER_URL" -H 'Content-Type: application/json' ${hdr[@]+"${hdr[@]}"} \
     -d "$(jq -nc --arg p "$_NAME_INSTR$1" '{messages:[{role:"user",content:$p}],max_tokens:20,temperature:0.2}')" \
     2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true
 }
@@ -303,8 +309,9 @@ cmd_abandon(){
 # ===== Built-in judge =====
 # Calls an LLM endpoint (OpenAI-compatible; local Qwen via MLX by default) to
 # score each agent's work and explain why, on demand, from the diff + the agent's
-# recent output. COCKPIT_JUDGE_URL overrides the endpoint.
-: "${COCKPIT_JUDGE_URL:=http://localhost:8800/v1/chat/completions}"
+# recent output. COCKPIT_JUDGE_URL overrides the endpoint; COCKPIT_JUDGE_AUTH
+# adds an Authorization header for hosted endpoints.
+: "${COCKPIT_JUDGE_URL:=http://localhost:11434/v1/chat/completions}"
 
 _wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files), capped
   local path="$1" base f
@@ -319,11 +326,12 @@ _wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files)
 
 _judge_one(){   # $1=path $2=task prompt $3=pane_id -> "score|reason"
   local path="$1" prompt="$2" pane="$3" diff out req resp score reason
+  local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   [ -n "$path" ] && diff=$(_wt_diff "$path") || diff=""
   out=$(tmux capture-pane -p -S -120 -t "$pane" 2>/dev/null | tail -100 | head -c 4000)
   req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" \
     '{messages:[{role:"user",content:("You are a strict reviewer. Rate 0-10 how well the agent accomplished the task. If it made code changes (see Diff), judge their correctness, completeness and quality. If there are no code changes (a conversational, research, or analysis task), judge the correctness and quality of its response in Output instead — do NOT penalize for an empty diff in that case. Return STRICT JSON only: {\"score\":N,\"reason\":\"one short sentence\"}.\nTask: " + $t + "\n\nDiff (may be empty):\n" + $d + "\n\nAgent output:\n" + $o)}],max_tokens:160,temperature:0.2}')
-  resp=$(curl -s --max-time 45 "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+  resp=$(curl -s --max-time 45 "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
   score=$(printf '%s' "$resp" | jq -r '.score // empty' 2>/dev/null || true)
   reason=$(printf '%s' "$resp" | jq -r '.reason // empty' 2>/dev/null || true)
   if [ -z "$score" ]; then   # model wrapped JSON in prose — extract best-effort
