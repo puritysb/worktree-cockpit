@@ -436,6 +436,12 @@ cmd_abandon(){
 # recent output. COCKPIT_JUDGE_URL overrides the endpoint; COCKPIT_JUDGE_AUTH
 # adds an Authorization header for hosted endpoints.
 : "${COCKPIT_JUDGE_URL:=http://localhost:11434/v1/chat/completions}"
+# The judge sees as much context as fits its window: the full diff + the agent's
+# whole pane scrollback, each capped by these budgets (raise for a bigger-context
+# judge model; lower for a small local one). char ~ 1/3-1/4 token.
+: "${COCKPIT_JUDGE_OUTPUT_CHARS:=16000}"   # tail of each agent's terminal output
+: "${COCKPIT_JUDGE_DIFF_CHARS:=16000}"     # diff vs main
+: "${COCKPIT_JUDGE_TIMEOUT:=120}"          # seconds per agent (more context = slower)
 
 _wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files), capped
   local path="$1" base f
@@ -445,17 +451,18 @@ _wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files)
     for f in $(git -C "$path" ls-files --others --exclude-standard 2>/dev/null); do
       printf '\n--- new file: %s ---\n' "$f"; git -C "$path" diff --no-index -- /dev/null "$path/$f" 2>/dev/null
     done
-  } | head -c 6000
+  } | head -c "$COCKPIT_JUDGE_DIFF_CHARS"
 }
 
 _judge_one(){   # $1=path $2=task prompt $3=pane_id -> "score|reason"
   local path="$1" prompt="$2" pane="$3" diff out req resp score reason
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   [ -n "$path" ] && diff=$(_wt_diff "$path") || diff=""
-  out=$(tmux capture-pane -p -S -120 -t "$pane" 2>/dev/null | tail -100 | head -c 4000)
+  # Whole pane scrollback (history-limit is raised in setup), trimmed to budget.
+  out=$(tmux capture-pane -p -S - -t "$pane" 2>/dev/null | tail -c "$COCKPIT_JUDGE_OUTPUT_CHARS")
   req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" \
-    '{messages:[{role:"user",content:("You are a strict reviewer. Rate 0-10 how well the agent accomplished the task. If it made code changes (see Diff), judge their correctness, completeness and quality. If there are no code changes (a conversational, research, or analysis task), judge the correctness and quality of its response in Output instead — do NOT penalize for an empty diff in that case. Return STRICT JSON only: {\"score\":N,\"reason\":\"one short sentence\"}.\nTask: " + $t + "\n\nDiff (may be empty):\n" + $d + "\n\nAgent output:\n" + $o)}],max_tokens:160,temperature:0.2}')
-  resp=$(curl -s --max-time 45 "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}.\nTask: " + $t + "\n\nDiff vs main (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2}')
+  resp=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
   score=$(printf '%s' "$resp" | jq -r '.score // empty' 2>/dev/null || true)
   reason=$(printf '%s' "$resp" | jq -r '.reason // empty' 2>/dev/null || true)
   if [ -z "$score" ]; then   # model wrapped JSON in prose — extract best-effort
@@ -566,6 +573,9 @@ cmd_setup(){
   # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
   tmux set -g mouse on
   tmux setw -g mode-keys vi
+  # Keep lots of scrollback so `wtcp score` can feed the judge each agent's whole
+  # session (set before the agent panes are created, so they inherit it).
+  tmux set -g history-limit 100000
   echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-R score (ALL agents)"
   echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R judges EVERY agent and shows a popup."
   echo "  Move/resize: prefix+arrow = move (o = cycle) · prefix+z = fullscreen one (z to return) · prefix+Ctrl-arrow = resize."
