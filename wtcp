@@ -220,6 +220,54 @@ _pretrust(){      # $1 = task  $2 = repo root
   esac; done
 }
 
+# tmux layout checksum (pure bash; ord via printf "%d 'c").
+_layout_checksum(){
+  local s="$1" c=0 i ch o
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"; printf -v o '%d' "'$ch"
+    c=$(( (c>>1) + ((c&1)<<15) )); c=$(( (c + o) & 0xffff ))
+  done
+  printf '%04x' "$c"
+}
+# Distribute T cells across K parts with K-1 one-cell dividers between them.
+_split_sizes(){
+  local T="$1" K="$2" content base rem i out=""
+  content=$(( T - (K-1) )); base=$(( content / K )); rem=$(( content % K ))
+  for (( i=0; i<K; i++ )); do out="$out $(( base + (i<rem ? 1 : 0) ))"; done
+  printf '%s' "${out# }"
+}
+# Lay the grid window's panes out as a rows x cols grid (row-major; tmux fills
+# cells in pane-index order). Trailing blank pads were created last so they land
+# in the final cells. Falls back to tiled on a count mismatch / error.
+_apply_grid_layout(){
+  local cwin="$1" rows="$2" cols="$3" W H geo cs
+  local arr=(); while IFS= read -r p; do arr+=("${p#%}"); done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  local n=${#arr[@]}
+  (( n >= 2 )) || return 0
+  if (( n != rows*cols )); then tmux select-layout -t "$cwin" tiled 2>/dev/null || true; return 0; fi
+  read -r W H < <(tmux display -p -t "$cwin" '#{window_width} #{window_height}')
+  local CW CH CX CY x=0 y=0 r c k=0 cells body=""
+  read -ra CW <<< "$(_split_sizes "$W" "$cols")"
+  read -ra CH <<< "$(_split_sizes "$H" "$rows")"
+  CX=(); for (( c=0; c<cols; c++ )); do CX[c]=$x; x=$(( x + CW[c] + 1 )); done
+  CY=(); for (( r=0; r<rows; r++ )); do CY[r]=$y; y=$(( y + CH[r] + 1 )); done
+  if (( rows == 1 )); then
+    cells=""; for (( c=0; c<cols; c++ )); do
+      cells="${cells}${cells:+,}${CW[c]}x${H},${CX[c]},0,${arr[k]}"; k=$((k+1)); done
+    geo="${W}x${H},0,0{${cells}}"
+  else
+    for (( r=0; r<rows; r++ )); do
+      cells=""; for (( c=0; c<cols; c++ )); do
+        cells="${cells}${cells:+,}${CW[c]}x${CH[r]},${CX[c]},${CY[r]},${arr[k]}"; k=$((k+1)); done
+      if (( cols == 1 )); then body="${body}${body:+,}${cells}"
+      else body="${body}${body:+,}${W}x${CH[r]},0,${CY[r]}{${cells}}"; fi
+    done
+    geo="${W}x${H},0,0[${body}]"
+  fi
+  cs=$(_layout_checksum "$geo")
+  tmux select-layout -t "$cwin" "${cs},${geo}" 2>/dev/null || tmux select-layout -t "$cwin" tiled 2>/dev/null || true
+}
+
 # One round: branch N agents from base (empty base = current main) + broadcast prompt + assemble grid.
 _run_round(){
   local prompt="$1" task="$2" base="${3:-}"
@@ -229,13 +277,22 @@ _run_round(){
   local addargs=(); for a in $COCKPIT_AGENTS; do addargs+=(-a "$a"); done
   [ -n "$base" ] && addargs+=(--base "$base")
 
-  local before after
+  local before after nag tries=0 maxtries neww
   before=$(tmux list-windows -F '#{window_id}' | sort)
+  nag=0; for a in $COCKPIT_AGENTS; do nag=$((nag+1)); done
   echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
   _wm add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null
-  sleep 1
-  after=$(tmux list-windows -F '#{window_id}' | sort)
-  local neww; neww=$(comm -13 <(echo "$before") <(echo "$after") || true)
+  # workmux creates each worktree sequentially (~1.5-2s each), so poll until all
+  # agent windows have appeared rather than guessing a fixed sleep. Scale the
+  # timeout with the agent count (+slack).
+  maxtries=$(( nag * 14 + 10 ))
+  while :; do
+    after=$(tmux list-windows -F '#{window_id}' | sort)
+    neww=$(comm -13 <(echo "$before") <(echo "$after") || true)
+    [ "$(printf '%s\n' "$neww" | grep -c .)" -ge "$nag" ] && break
+    tries=$((tries+1)); [ "$tries" -ge "$maxtries" ] && break
+    sleep 0.3
+  done
   [ -n "$neww" ] || die "no new worktree windows found (workmux add failed?)"
 
   # Grid window: pull each agent pane in with join-pane (pane_id is stable across the move).
@@ -244,6 +301,7 @@ _run_round(){
   ph=$(tmux list-panes -t "$cwin" -F '#{pane_id}' | head -1)
   tmux set-option -w -t "$cwin" @cockpit_root "$root"
   tmux set-option -w -t "$cwin" @cockpit_prompt "$prompt"   # used as the pick auto-commit message
+  local apanes=()
   while IFS= read -r w; do
     [ -n "$w" ] || continue
     local wt src
@@ -253,11 +311,28 @@ _run_round(){
     wt=$(tmux display-message -p -t "$w" '#{window_name}'); wt="${wt##* }"
     src=$(tmux list-panes -t "$w" -F '#{pane_id}' | head -1)
     tmux join-pane -d -s "$src" -t "$cwin"
+    # Re-tile after each join: join-pane stacks vertically, so without this the
+    # 5th/6th pane gets "create pane failed: pane too small". Tiling keeps panes
+    # balanced (and large enough) during assembly; final shape set below.
+    tmux select-layout -t "$cwin" tiled 2>/dev/null || true
     tmux set-option -p -t "$src" @worktree "$wt"
     tmux set-option -p -t "$src" @pane_label "$wt"
+    apanes+=("$src")
   done <<< "$neww"
   tmux kill-pane -t "$ph" 2>/dev/null || true
-  tmux select-layout -t "$cwin" tiled
+  tmux select-layout -t "$cwin" tiled 2>/dev/null || true
+  # Grid shape: 2/3 agents -> one row; 4-6 -> two rows. cols = ceil(N/rows).
+  # Pad the trailing cells (only N=5 needs one) with blank panes, created last so
+  # they fill the final (bottom-right) cells.
+  local N=${#apanes[@]} grows gcols j pad lastp
+  if (( N <= 3 )); then grows=1; else grows=2; fi
+  gcols=$(( (N + grows - 1) / grows ))
+  for (( j=N; j<grows*gcols; j++ )); do
+    lastp=$(tmux list-panes -t "$cwin" -F '#{pane_id}' | tail -1)
+    pad=$(tmux split-window -d -t "$lastp" -P -F '#{pane_id}' "clear; exec cat")
+    tmux set-option -p -t "$pad" @pane_label "(empty)"
+  done
+  _apply_grid_layout "$cwin" "$grows" "$gcols"
   # Full-width bottom command bar (grid compresses above it; it survives drops).
   local bar
   bar=$(tmux split-window -d -f -v -l "$BAR_HEIGHT" -t "$cwin" -P -F '#{pane_id}' \
@@ -315,6 +390,8 @@ _resolve_task(){
 
 cmd_broadcast(){
   need_tmux; need_repo
+  local nck=0 a; for a in $COCKPIT_AGENTS; do nck=$((nck+1)); done
+  [ "$nck" -le 6 ] || die "at most 6 agents are supported (COCKPIT_AGENTS has $nck) — edit ~/.config/wtcp/config"
   cmd_setup   # install keybindings + mouse/scroll (idempotent) so `wtcp start` alone is enough
   local prompt="${1:-}"; [ -n "$prompt" ] || die 'start "<prompt>" [name]'
   local task="${2:-}"; [ -n "$task" ] || task=$(slugify "$prompt"); [ -n "$task" ] || task="t$(date +%H%M%S)"
@@ -415,6 +492,7 @@ cmd_score(){
 # Show or set the agent set compared by `wtcp start` (persists to ~/.config/wtcp/config).
 cmd_agents(){
   if [ "$#" -eq 0 ]; then echo "$COCKPIT_AGENTS"; return 0; fi
+  [ "$#" -le 6 ] || die "at most 6 agents are supported (got $#)"
   mkdir -p "$(dirname "$WTCP_CONFIG")"
   local val="$*"
   if [ -f "$WTCP_CONFIG" ] && grep -q '^COCKPIT_AGENTS=' "$WTCP_CONFIG"; then
