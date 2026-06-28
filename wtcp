@@ -186,7 +186,11 @@ _run_round(){
   local before after
   before=$(tmux list-windows -F '#{window_id}' | sort)
   echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
-  workmux add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null
+  # stdin from /dev/null: workmux goes interactive when stdin is a TTY (it can
+  # block waiting for input, e.g. for raw-string agents created by COCKPIT_TRUST),
+  # which would hang the round since we discard its stdout. Closing stdin makes
+  # it run non-interactively. The agents still get their own pane TTYs.
+  workmux add "$task" "${addargs[@]}" -p "$prompt" -b </dev/null >/dev/null
   sleep 1
   after=$(tmux list-windows -F '#{window_id}' | sort)
   local neww; neww=$(comm -13 <(echo "$before") <(echo "$after") || true)
