@@ -305,6 +305,7 @@ _resolve_task(){
 
 cmd_broadcast(){
   need_tmux; need_repo
+  cmd_setup   # install keybindings + mouse/scroll (idempotent) so `wtcp start` alone is enough
   local prompt="${1:-}"; [ -n "$prompt" ] || die 'start "<prompt>" [name]'
   local task="${2:-}"; [ -n "$task" ] || task=$(slugify "$prompt"); [ -n "$task" ] || task="t$(date +%H%M%S)"
   _resolve_task "$task"; task="$RESOLVED_TASK"
