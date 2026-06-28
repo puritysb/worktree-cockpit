@@ -48,6 +48,11 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 INVOKE="${COCKPIT_INVOKE:-$(command -v wtcp || echo "$SELF")}"
 
 die(){ echo "wtcp: $*" >&2; exit 1; }
+# workmux goes interactive when its stdin is a TTY and can then BLOCK waiting for
+# input — even with -f — e.g. for raw-string agents (created by COCKPIT_TRUST or
+# used by agy) on `add`, and a select UI on `remove`. Run every workmux call with
+# stdin closed so it stays non-interactive; spawned agents still get pane TTYs.
+_wm(){ command workmux "$@" </dev/null; }
 need_tmux(){ [ -n "${TMUX:-}" ] || die "run inside a tmux session"; }
 need_repo(){ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run inside a git repository"; }
 goto_root(){ local r; r=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true); [ -n "$r" ] && cd "$r" || true; }
@@ -62,7 +67,7 @@ _send_to_pane(){
 }
 # Absolute worktree path (workmux path -> fallback to <repo>__worktrees/<wt>).
 _wt_path(){
-  local p root; p=$(workmux path "$1" 2>/dev/null || true)
+  local p root; p=$(_wm path "$1" 2>/dev/null || true)
   if [ -z "$p" ] || [ ! -d "$p" ]; then
     root=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true)
     [ -n "$root" ] && p="$(dirname "$root")/$(basename "$root")__worktrees/$1"
@@ -186,11 +191,7 @@ _run_round(){
   local before after
   before=$(tmux list-windows -F '#{window_id}' | sort)
   echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
-  # stdin from /dev/null: workmux goes interactive when stdin is a TTY (it can
-  # block waiting for input, e.g. for raw-string agents created by COCKPIT_TRUST),
-  # which would hang the round since we discard its stdout. Closing stdin makes
-  # it run non-interactively. The agents still get their own pane TTYs.
-  workmux add "$task" "${addargs[@]}" -p "$prompt" -b </dev/null >/dev/null
+  _wm add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null
   sleep 1
   after=$(tmux list-windows -F '#{window_id}' | sort)
   local neww; neww=$(comm -13 <(echo "$before") <(echo "$after") || true)
@@ -255,7 +256,7 @@ _free_task(){
 # Remove the existing `<task>-<agent>` worktrees so the name can be reused.
 _clean_task(){
   local a
-  for a in $COCKPIT_AGENTS; do workmux remove "$1-$a" -f 2>/dev/null || true; done
+  for a in $COCKPIT_AGENTS; do _wm remove "$1-$a" -f 2>/dev/null || true; done
 }
 # On collision, ask the user what to do. Sets global RESOLVED_TASK (or aborts).
 # Defaults to auto-rename when there's no TTY (non-interactive).
@@ -286,7 +287,7 @@ cmd_fork(){
   local fp wt; fp=$(tmux display -p '#{pane_id}'); wt=$(pane_wt "$fp")
   [ -n "$wt" ] || die "put the cursor on the agent pane to fork from (not the bar/empty pane)"
   goto_root
-  local wpath; wpath=$(workmux path "$wt" 2>/dev/null || true)
+  local wpath; wpath=$(_wm path "$wt" 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
     echo "wtcp: committing [$wt] WIP (pinning the fork base)..."
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "wip: fork base from $wt" || true
@@ -304,7 +305,7 @@ cmd_abandon(){
   goto_root
   local p wt
   while IFS= read -r p; do
-    wt=$(pane_wt "$p"); [ -n "$wt" ] && (workmux remove "$wt" -f || true)
+    wt=$(pane_wt "$p"); [ -n "$wt" ] && (_wm remove "$wt" -f || true)
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
   tmux kill-window -t "$cwin" 2>/dev/null || true
   echo "wtcp: grid abandoned (nothing merged)."
@@ -408,15 +409,15 @@ cmd_pick(){
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
   goto_root
   # Auto-commit the winner's uncommitted changes (workmux merge only takes commits -> else work is lost).
-  local wpath; wpath=$(workmux path "$winner" 2>/dev/null || true)
+  local wpath; wpath=$(_wm path "$winner" 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
     local msg; msg=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
     echo "wtcp: auto-committing the winner's uncommitted changes..."
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" || true
   fi
   echo "wtcp: winner [$winner] -> merge to main / cleanup: ${losers[*]:-(none)}"
-  workmux merge "$winner" || die "merge failed (resolve conflicts)"
-  local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (workmux remove "$l" -f || true); done
+  _wm merge "$winner" || die "merge failed (resolve conflicts)"
+  local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
   tmux kill-window -t "$cwin" 2>/dev/null || true
   echo "wtcp: done. merged to main — keep working or start another round."
 }
@@ -427,7 +428,7 @@ cmd_drop(){
   [ -n "$wt" ] || die "put the cursor on the agent pane to drop (not the bar/empty pane)"
   goto_root
   echo "wtcp: dropping [$wt] (remove worktree + close pane, grid re-tiles)"
-  workmux remove "$wt" -f || true
+  _wm remove "$wt" -f || true
   tmux kill-pane -t "$fp" 2>/dev/null || true     # only the top grid re-flows; the bottom bar stays
 }
 
@@ -459,7 +460,7 @@ cmd_grid(){
   tmux select-window -t "$w"
 }
 
-cmd_list(){ workmux list; }
+cmd_list(){ _wm list; }
 
 cmd_clean(){
   need_repo
@@ -469,7 +470,7 @@ cmd_clean(){
     < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')
   # 2) remove all worktrees + their windows
   echo "wtcp: closing grid windows + removing all worktrees (except main)..."
-  workmux remove --all -f
+  _wm remove --all -f
 }
 
 # Short aliases match the in-grid keybinding letters (b=start, s/p/f/x/a/g/r).
