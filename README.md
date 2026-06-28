@@ -19,11 +19,23 @@ the results (via any LLM endpoint) and merge the winner to `main`.
 
 ## Requirements
 
-- `tmux`, `workmux`, `git`, `jq`, `curl`
-- The agent CLIs you want to compare (`claude`, `codex`, `opencode`, `gemini`, `agy`, …)
-- An OpenAI-compatible **LLM endpoint** for scoring/naming (local
-  [MLX](https://github.com/ml-explore/mlx)/Ollama, OpenAI, or anything
-  compatible). On macOS, branch naming can use on-device Apple Intelligence.
+**Core tools** — `tmux`, `git`, `jq`, `curl` (usually preinstalled or one `brew`/
+`apt` away), plus [**workmux**](https://github.com/raine/workmux), the worktree
+manager wtcp drives:
+
+```sh
+brew install raine/workmux/workmux      # macOS / Linuxbrew
+```
+
+**Agent CLIs** — install and **log in to** the ones you want to compare; wtcp only
+launches them. Builtins workmux knows: `claude`, `codex`, `opencode`, `gemini`.
+Others (e.g. `agy` / Antigravity) are auto-configured by wtcp. Each agent must
+already be authenticated on your machine.
+
+**An LLM endpoint** — used by `wtcp score` (and, off macOS, branch naming). Any
+OpenAI-compatible `/chat/completions` works. Pick one and set `COCKPIT_JUDGE_URL`
+(see [LLM endpoint](#llm-endpoint) below). On macOS, branch naming additionally
+uses on-device Apple Intelligence with no setup.
 
 ## Install
 
@@ -40,6 +52,22 @@ mkdir -p ~/.config/wtcp
 cp wtcp.config.example ~/.config/wtcp/config
 $EDITOR ~/.config/wtcp/config        # set COCKPIT_JUDGE_URL at minimum
 ```
+
+### LLM endpoint
+
+`wtcp score` needs one OpenAI-compatible `/chat/completions` URL. Set it once in
+`~/.config/wtcp/config` as `COCKPIT_JUDGE_URL`. Common choices:
+
+| Provider | `COCKPIT_JUDGE_URL` | Notes |
+|----------|---------------------|-------|
+| **Ollama** (local, free) | `http://localhost:11434/v1/chat/completions` | `ollama pull qwen2.5-coder` first |
+| **LM Studio** (local) | `http://localhost:1234/v1/chat/completions` | start its local server |
+| **MLX** (local, Apple Silicon) | `http://localhost:8800/v1/chat/completions` | `mlx_lm.server` |
+| **OpenAI** | `https://api.openai.com/v1/chat/completions` | also export `OPENAI_API_KEY`-style auth in the request (edit the script if you need an `Authorization` header) |
+
+A local model (Ollama/LM Studio/MLX) is the easiest start — no keys, runs offline.
+If `wtcp score` shows *"no judgment — is the judge LLM running?"*, the endpoint
+isn't reachable: check the URL and that the server is up.
 
 ## Usage
 

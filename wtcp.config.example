@@ -6,13 +6,17 @@
 COCKPIT_AGENTS="claude codex opencode"
 
 # LLM judge endpoint (OpenAI-compatible /chat/completions) used by `wtcp score`.
-# Point at a local MLX/Ollama server, OpenAI, or any compatible endpoint.
-COCKPIT_JUDGE_URL="http://localhost:8800/v1/chat/completions"
+# Pick ONE you actually run. Common local options (no API key, offline):
+#   Ollama:    http://localhost:11434/v1/chat/completions   (ollama pull qwen2.5-coder)
+#   LM Studio: http://localhost:1234/v1/chat/completions
+#   MLX:       http://localhost:8800/v1/chat/completions
+# Or a hosted endpoint, e.g. https://api.openai.com/v1/chat/completions
+COCKPIT_JUDGE_URL="http://localhost:11434/v1/chat/completions"
 
 # Branch-name generator from the prompt: fm (Apple Intelligence, macOS, on-device)
-# | mlx (local Qwen via COCKPIT_NAMER_URL) | off (ASCII slug of the prompt).
+# | mlx (local LLM via COCKPIT_NAMER_URL) | off (ASCII slug of the prompt).
 COCKPIT_NAMER="fm"
-COCKPIT_NAMER_URL="http://localhost:8800/v1/chat/completions"
+COCKPIT_NAMER_URL="http://localhost:11434/v1/chat/completions"
 
 # OPT-IN. 1 = launch agents with their folder-trust/permission/sandbox bypass
 # flags so a brand-new project auto-starts instead of stopping at "Do you trust
