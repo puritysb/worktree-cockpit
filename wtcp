@@ -160,10 +160,14 @@ _set_agent_cfg(){
 
 # Configure the agents in the set so a round launches cleanly:
 #  - agy: a wrapper that loads the prompt from .workmux/PROMPT-*.md (it can't take
-#    workmux's `-- "..."` form) and runs `agy -i`.
-#  - claude/codex: when COCKPIT_TRUST=1, launch with their folder-trust/permission
-#    bypass flags so a brand-new project auto-starts instead of stopping at "Do
-#    you trust this folder?". workmux still appends the prompt.
+#    workmux's `-- "..."` form) and runs `agy -i`. The wrapper is always installed
+#    (prompt delivery); COCKPIT_TRUST only adds agy's permission-bypass flag.
+#  - claude/codex: when COCKPIT_TRUST=1, launch in an unattended permission mode.
+#    The "Do you trust this folder?" dialog is skipped separately by _pretrust
+#    (seeding each agent's own trust store), NOT by these flags. Defaults:
+#      claude -> auto mode (asks like normal, just doesn't stop the round)
+#      codex  -> bypass approvals+sandbox
+#    Override per agent with COCKPIT_CLAUDE_CMD / COCKPIT_CODEX_CMD.
 #  - opencode: left as the builtin (no trust prompt).
 # Note: this edits the workmux GLOBAL config, so it also affects plain `workmux
 # -a claude/codex`. Set COCKPIT_TRUST=0 (default) to keep the safety prompts.
@@ -175,8 +179,8 @@ _ensure_agent_configs(){
       local W="$HOME/.config/wtcp/agy-wm"; mkdir -p "$(dirname "$W")"
       printf '#!/bin/sh\np=$(cat .workmux/PROMPT-*.md 2>/dev/null)\nexec agy %s-i "$p"\n' "$flag" > "$W"; chmod +x "$W"
       _set_agent_cfg agy "$W" ;;
-    claude) [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg claude "claude --dangerously-skip-permissions" ;;
-    codex)  [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg codex "codex --dangerously-bypass-approvals-and-sandbox" ;;
+    claude) [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg claude "${COCKPIT_CLAUDE_CMD:-claude --permission-mode auto}" ;;
+    codex)  [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg codex "${COCKPIT_CODEX_CMD:-codex --dangerously-bypass-approvals-and-sandbox}" ;;
   esac; done
 }
 
