@@ -4,7 +4,7 @@
 #
 # COMMANDS                              alias   in-grid key   what it does
 #   wtcp start "<prompt>" [name]        b                     start a round: broadcast to every agent + build the grid
-#   wtcp score                          r       prefix Ctrl-R judge every agent with an LLM (★ on borders + "why" popup)
+#   wtcp score                          r       prefix Ctrl-R compare all agents with an LLM: rank + 🏆winner (★ on borders + popup)
 #   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into main (auto-commit), drop the rest
 #   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
 #   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
@@ -441,7 +441,11 @@ cmd_abandon(){
 # judge model; lower for a small local one). char ~ 1/3-1/4 token.
 : "${COCKPIT_JUDGE_OUTPUT_CHARS:=16000}"   # tail of each agent's terminal output
 : "${COCKPIT_JUDGE_DIFF_CHARS:=16000}"     # diff vs main
-: "${COCKPIT_JUDGE_TIMEOUT:=120}"          # seconds per agent (more context = slower)
+: "${COCKPIT_JUDGE_TIMEOUT:=120}"          # seconds per judge request (more context = slower)
+# Comparative scoring (wtcp score) sends ALL agents in one call; this is the
+# TOTAL evidence budget split across them (per-agent = this / (agents*2)), kept
+# small enough to fit the judge's context. Raise for a bigger-context model.
+: "${COCKPIT_JUDGE_COMPARE_CHARS:=48000}"
 
 _wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files), capped
   local path="$1" base f
@@ -472,27 +476,92 @@ _judge_one(){   # $1=path $2=task prompt $3=pane_id -> "score|reason"
   printf '%s|%s' "${score:-?}" "${reason:-(no judgment — is the judge LLM running?)}"
 }
 
-# Score every agent in the grid with the judge: ★score on each pane border + a
-# dismissable popup explaining why. Takes a few seconds per agent.
+# Fallback: judge each agent independently (used if comparative parsing fails).
+_score_independent(){
+  local cwin="$1" prompt="$2"; shift 2
+  local p wt path res sc reason summary=""
+  for p in "$@"; do
+    wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
+    path=$(_wt_path "$wt")
+    res=$(_judge_one "$path" "$prompt" "$p"); sc="${res%%|*}"; reason="${res#*|}"
+    tmux set-option -p -t "$p" @pane_label "$wt   ★ $sc"
+    tmux set-option -p -t "$p" @judge_reason "$reason"
+    summary="${summary}★ ${sc}   ${wt}\n    ${reason}\n\n"
+  done
+  local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
+  { printf 'Task: %s\n\n' "${prompt:-(unknown)}"; printf '%b' "$summary"; } > "$F" 2>/dev/null || true
+  tmux display-popup -E -w 82% -h 60% "${PAGER:-less} '$F'" 2>/dev/null || true
+}
+
+# Comparative scoring: send ALL agents to the judge in one call so it ranks them
+# head-to-head and picks a winner. ★score (+🏆 winner) on each pane border + a
+# popup with the comparison. Falls back to independent scoring if it can't parse.
 cmd_score(){
   need_tmux; goto_root
   local cwin prompt; cwin=$(tmux display -p '#{window_id}')
   prompt=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true)
   tmux set-window-option -t "$cwin" pane-border-status top
   tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
-  local p wt path res sc reason summary=""
+  # Collect agent panes (skip the bar/empty panes).
+  local p wt names=() panes=() nag=0
   while IFS= read -r p; do
     wt=$(pane_wt "$p")
     if [ -z "$wt" ]; then tmux set-option -p -t "$p" @pane_label "$BAR_KEYS"; continue; fi
+    names+=("$wt"); panes+=("$p"); nag=$((nag+1))
     tmux set-option -p -t "$p" @pane_label "$wt   judging..."
-    path=$(_wt_path "$wt")
-    res=$(_judge_one "$path" "$prompt" "$p"); sc="${res%%|*}"; reason="${res#*|}"
-    tmux set-option -p -t "$p" @pane_label "$wt   ★ $sc"
-    tmux set-option -p -t "$p" @judge_reason "$reason"
-    summary="${summary}★ ${sc}   ${wt}\n    ${reason}\n\n"
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  [ "$nag" -ge 1 ] || { tmux display-message "wtcp: no agents to score" 2>/dev/null; return 0; }
+
+  # Per-agent evidence budget so all agents fit the judge's context window.
+  local per=$(( COCKPIT_JUDGE_COMPARE_CHARS / (nag*2) )); [ "$per" -ge 800 ] || per=800
+  local i blocks="" path diff out
+  for (( i=0; i<nag; i++ )); do
+    path=$(_wt_path "${names[i]}")
+    [ -n "$path" ] && diff=$(_wt_diff "$path" | head -c "$per") || diff=""
+    out=$(tmux capture-pane -p -S - -t "${panes[i]}" 2>/dev/null | tail -c "$per")
+    blocks="${blocks}"$'\n\n'"=== AGENT: ${names[i]} ==="$'\n'"--- Diff vs main (may be empty) ---"$'\n'"${diff}"$'\n'"--- Terminal output ---"$'\n'"${out}"
+  done
+
+  local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
+  local instr req resp
+  instr="You are a rigorous, skeptical senior engineer comparing several agents that each attempted the SAME task. Compare them head-to-head on correctness, completeness, depth, and actionability. Where there is a code Diff, weigh its correctness most; for analysis/research tasks (empty diff) judge the substance and accuracy of the Output. Be calibrated and discriminating: spread the scores so the ranking is meaningful, reserve 9-10 for genuinely complete and correct work, and penalize wrong claims, vagueness, or unfinished work. Use only the evidence shown. Return STRICT JSON only, no prose: {\"rankings\":[{\"name\":\"<exact agent name>\",\"score\":N,\"reason\":\"1-2 sentences comparing it to the others\"}],\"winner\":\"<exact name>\",\"summary\":\"2-3 sentences on why the winner beat the rest\"}. Include EVERY agent in rankings, best first, name copied EXACTLY."
+  req=$(jq -nc --arg s "$instr" --arg t "${prompt:-(unknown task)}" --arg b "$blocks" \
+    '{messages:[{role:"user",content:($s + "\n\nTask: " + $t + "\n\nAGENTS (compare these):" + $b)}],max_tokens:700,temperature:0.2}')
+  resp=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+
+  local winner; winner=$(printf '%s' "$resp" | jq -r '.winner // empty' 2>/dev/null || true)
+  if ! printf '%s' "$resp" | jq -e '.rankings[0].name' >/dev/null 2>&1; then
+    _score_independent "$cwin" "$prompt" "${panes[@]}"   # couldn't parse -> per-agent fallback
+    return 0
+  fi
+
+  # Write the comparative report (jq formats the whole file).
   local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
-  { printf 'Task: %s\n\n' "${prompt:-(unknown)}"; printf '%b' "$summary"; } > "$F" 2>/dev/null || true
+  printf '%s' "$resp" | jq -r --arg task "${prompt:-(unknown)}" '
+    .winner as $w
+    | "Task: \($task)\n\n"
+      + (if $w then "🏆 Winner: \($w)\n\n" else "" end)
+      + ((.summary // "") | if . != "" then . + "\n\n" else "" end)
+      + ([.rankings[] | "★ \(.score)   \(.name)\(if .name==$w then "   🏆" else "" end)\n    \(.reason)\n"] | join("\n"))
+  ' > "$F" 2>/dev/null || true
+
+  # Stamp each pane border with its ★score (+🏆 winner).
+  local nm sc rs mark
+  while IFS=$'\t' read -r nm sc rs; do
+    for (( i=0; i<nag; i++ )); do
+      [ "${names[i]}" = "$nm" ] || continue
+      mark=""; [ "$nm" = "$winner" ] && mark=" 🏆"
+      tmux set-option -p -t "${panes[i]}" @pane_label "${names[i]}   ★ ${sc}${mark}"
+      tmux set-option -p -t "${panes[i]}" @judge_reason "$rs"
+    done
+  done < <(printf '%s' "$resp" | jq -r '.rankings[] | [.name,(.score|tostring),.reason] | @tsv' 2>/dev/null)
+  # Any agent the judge skipped -> mark unknown so the border isn't stuck on "judging...".
+  for (( i=0; i<nag; i++ )); do
+    case "$(tmux show-options -pqv -t "${panes[i]}" @pane_label 2>/dev/null)" in
+      *"★ "*) ;; *) tmux set-option -p -t "${panes[i]}" @pane_label "${names[i]}   ★ ?";;
+    esac
+  done
+
   tmux display-popup -E -w 82% -h 60% "${PAGER:-less} '$F'" 2>/dev/null || true
 }
 
