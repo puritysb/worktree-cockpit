@@ -54,6 +54,8 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 INVOKE="${COCKPIT_INVOKE:-$(command -v wtcp || echo "$SELF")}"
 
 die(){ echo "wtcp: $*" >&2; exit 1; }
+_sh_quote(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+INVOKE_Q=$(_sh_quote "$INVOKE")
 # workmux goes interactive when its stdin is a TTY and can then BLOCK waiting for
 # input — even with -f — e.g. for raw-string agents (created by COCKPIT_TRUST or
 # used by agy) on `add`, and a select UI on `remove`. Run every workmux call with
@@ -70,6 +72,9 @@ _send_to_pane(){
   tmux send-keys -t "$1" -l -- "$2"
   sleep "$COCKPIT_SEND_DELAY"
   tmux send-keys -t "$1" Enter
+}
+_current_ref(){
+  git symbolic-ref --quiet --short HEAD 2>/dev/null || git rev-parse --short HEAD
 }
 # Absolute worktree path (workmux path -> fallback to <repo>__worktrees/<wt>).
 _wt_path(){
@@ -273,12 +278,12 @@ _run_round(){
   local prompt="$1" task="$2" base="${3:-}"
   _ensure_agent_configs   # agy wrapper + (COCKPIT_TRUST) tool-approval bypass flags for claude/codex
   local root; root=$(git rev-parse --show-toplevel)
+  local round_base; round_base="${base:-$(_current_ref)}"
   _pretrust "$task" "$root"   # (COCKPIT_TRUST) pre-trust the claude/codex worktrees so they auto-start
   local addargs=(); for a in $COCKPIT_AGENTS; do addargs+=(-a "$a"); done
   [ -n "$base" ] && addargs+=(--base "$base")
 
-  local before after nag tries=0 maxtries neww
-  before=$(tmux list-windows -F '#{window_id}' | sort)
+  local nag tries=0 maxtries neww found_count
   nag=0; for a in $COCKPIT_AGENTS; do nag=$((nag+1)); done
   echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
   _wm add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null
@@ -287,13 +292,13 @@ _run_round(){
   # timeout with the agent count (+slack).
   maxtries=$(( nag * 14 + 10 ))
   while :; do
-    after=$(tmux list-windows -F '#{window_id}' | sort)
-    neww=$(comm -13 <(echo "$before") <(echo "$after") || true)
-    [ "$(printf '%s\n' "$neww" | grep -c .)" -ge "$nag" ] && break
+    neww=$(_find_task_windows "$task")
+    found_count=$(printf '%s\n' "$neww" | grep -c . || true)
+    [ "$found_count" -ge "$nag" ] && break
     tries=$((tries+1)); [ "$tries" -ge "$maxtries" ] && break
     sleep 0.3
   done
-  [ -n "$neww" ] || die "no new worktree windows found (workmux add failed?)"
+  [ "${found_count:-0}" -eq "$nag" ] || die "expected $nag worktree windows for '$task', found ${found_count:-0} (workmux add incomplete?)"
 
   # Grid window: pull each agent pane in with join-pane (pane_id is stable across the move).
   local cwin ph
@@ -301,14 +306,15 @@ _run_round(){
   ph=$(tmux list-panes -t "$cwin" -F '#{pane_id}' | head -1)
   tmux set-option -w -t "$cwin" @cockpit_root "$root"
   tmux set-option -w -t "$cwin" @cockpit_prompt "$prompt"   # used as the pick auto-commit message
-  local apanes=()
-  while IFS= read -r w; do
+  tmux set-option -w -t "$cwin" @cockpit_base "$round_base"  # used as the judge diff base
+  local apanes=() join_lines=() line idx
+  while IFS= read -r line; do [ -n "$line" ] && join_lines+=("$line"); done <<< "$neww"
+  # join-pane inserts each joined pane before the existing panes in this tmux
+  # layout, so join in reverse to make pane-index order match COCKPIT_AGENTS.
+  for (( idx=${#join_lines[@]}-1; idx>=0; idx-- )); do
+    IFS=' ' read -r w wt <<< "${join_lines[idx]}"
     [ -n "$w" ] || continue
-    local wt src
-    # workmux puts a nerd-font branch icon + space in the window name when
-    # nerdfont is on. Strip everything up to the last space so @worktree is the
-    # clean branch name (else workmux path/remove/diff all miss).
-    wt=$(tmux display-message -p -t "$w" '#{window_name}'); wt="${wt##* }"
+    local src
     src=$(tmux list-panes -t "$w" -F '#{pane_id}' | head -1)
     tmux join-pane -d -s "$src" -t "$cwin"
     # Re-tile after each join: join-pane stacks vertically, so without this the
@@ -318,7 +324,7 @@ _run_round(){
     tmux set-option -p -t "$src" @worktree "$wt"
     tmux set-option -p -t "$src" @pane_label "$wt"
     apanes+=("$src")
-  done <<< "$neww"
+  done
   tmux kill-pane -t "$ph" 2>/dev/null || true
   tmux select-layout -t "$cwin" tiled 2>/dev/null || true
   # Grid shape: 2/3 agents -> one row; 4-6 -> two rows. cols = ceil(N/rows).
@@ -373,6 +379,19 @@ _free_task(){
 _clean_task(){
   local a
   for a in $COCKPIT_AGENTS; do _wm remove "$1-$a" -f 2>/dev/null || true; done
+}
+_find_task_windows(){   # $1 = task; prints "<window-id> <worktree>" in COCKPIT_AGENTS order
+  local task="$1" a want w name wt found
+  for a in $COCKPIT_AGENTS; do
+    want="$task-$a"; found=""
+    while IFS= read -r w; do
+      [ -n "$w" ] || continue
+      name=$(tmux display-message -p -t "$w" '#{window_name}' 2>/dev/null || true)
+      wt="${name##* }"
+      if [ "$wt" = "$want" ]; then found="$w"; break; fi
+    done < <(tmux list-windows -F '#{window_id}')
+    [ -n "$found" ] && printf '%s %s\n' "$found" "$want"
+  done
 }
 # On collision, ask the user what to do. Sets global RESOLVED_TASK (or aborts).
 # Defaults to auto-rename when there's no TTY (non-interactive).
@@ -447,25 +466,30 @@ cmd_abandon(){
 # small enough to fit the judge's context. Raise for a bigger-context model.
 : "${COCKPIT_JUDGE_COMPARE_CHARS:=48000}"
 
-_wt_diff(){   # $1=worktree path -> diff vs main (tracked + untracked new files), capped
-  local path="$1" base f
-  base=main; git -C "$path" rev-parse --verify -q main >/dev/null 2>&1 || base=master
+_wt_diff(){   # $1=worktree path $2=base ref -> diff vs base (tracked + untracked new files), capped
+  local path="$1" base="${2:-}" f
+  if [ -n "$base" ] && ! git -C "$path" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1; then
+    base=""
+  fi
+  if [ -z "$base" ]; then
+    base=main; git -C "$path" rev-parse --verify -q main >/dev/null 2>&1 || base=master
+  fi
   {
     git -C "$path" diff "$base" 2>/dev/null
-    for f in $(git -C "$path" ls-files --others --exclude-standard 2>/dev/null); do
+    while IFS= read -r -d '' f; do
       printf '\n--- new file: %s ---\n' "$f"; git -C "$path" diff --no-index -- /dev/null "$path/$f" 2>/dev/null
-    done
+    done < <(git -C "$path" ls-files -z --others --exclude-standard 2>/dev/null)
   } | head -c "$COCKPIT_JUDGE_DIFF_CHARS"
 }
 
-_judge_one(){   # $1=path $2=task prompt $3=pane_id -> "score|reason"
-  local path="$1" prompt="$2" pane="$3" diff out req resp score reason
+_judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason"
+  local path="$1" prompt="$2" pane="$3" base="${4:-}" diff out req resp score reason
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
-  [ -n "$path" ] && diff=$(_wt_diff "$path") || diff=""
+  [ -n "$path" ] && diff=$(_wt_diff "$path" "$base") || diff=""
   # Whole pane scrollback (history-limit is raised in setup), trimmed to budget.
   out=$(tmux capture-pane -p -S - -t "$pane" 2>/dev/null | tail -c "$COCKPIT_JUDGE_OUTPUT_CHARS")
   req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" \
-    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}.\nTask: " + $t + "\n\nDiff vs main (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2}')
+    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2}')
   resp=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
   score=$(printf '%s' "$resp" | jq -r '.score // empty' 2>/dev/null || true)
   reason=$(printf '%s' "$resp" | jq -r '.reason // empty' 2>/dev/null || true)
@@ -478,12 +502,12 @@ _judge_one(){   # $1=path $2=task prompt $3=pane_id -> "score|reason"
 
 # Fallback: judge each agent independently (used if comparative parsing fails).
 _score_independent(){
-  local cwin="$1" prompt="$2"; shift 2
+  local cwin="$1" prompt="$2" base="$3"; shift 3
   local p wt path res sc reason summary=""
   for p in "$@"; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
     path=$(_wt_path "$wt")
-    res=$(_judge_one "$path" "$prompt" "$p"); sc="${res%%|*}"; reason="${res#*|}"
+    res=$(_judge_one "$path" "$prompt" "$p" "$base"); sc="${res%%|*}"; reason="${res#*|}"
     tmux set-option -p -t "$p" @pane_label "$wt   ★ $sc"
     tmux set-option -p -t "$p" @judge_reason "$reason"
     summary="${summary}★ ${sc}   ${wt}\n    ${reason}\n\n"
@@ -498,8 +522,9 @@ _score_independent(){
 # popup with the comparison. Falls back to independent scoring if it can't parse.
 cmd_score(){
   need_tmux; goto_root
-  local cwin prompt; cwin=$(tmux display -p '#{window_id}')
+  local cwin prompt base; cwin=$(tmux display -p '#{window_id}')
   prompt=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true)
+  base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
   tmux set-window-option -t "$cwin" pane-border-status top
   tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
   # Collect agent panes (skip the bar/empty panes).
@@ -517,9 +542,9 @@ cmd_score(){
   local i blocks="" path diff out
   for (( i=0; i<nag; i++ )); do
     path=$(_wt_path "${names[i]}")
-    [ -n "$path" ] && diff=$(_wt_diff "$path" | head -c "$per") || diff=""
+    [ -n "$path" ] && diff=$(_wt_diff "$path" "$base" | head -c "$per") || diff=""
     out=$(tmux capture-pane -p -S - -t "${panes[i]}" 2>/dev/null | tail -c "$per")
-    blocks="${blocks}"$'\n\n'"=== AGENT: ${names[i]} ==="$'\n'"--- Diff vs main (may be empty) ---"$'\n'"${diff}"$'\n'"--- Terminal output ---"$'\n'"${out}"
+    blocks="${blocks}"$'\n\n'"=== AGENT: ${names[i]} ==="$'\n'"--- Diff vs base (may be empty) ---"$'\n'"${diff}"$'\n'"--- Terminal output ---"$'\n'"${out}"
   done
 
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
@@ -531,7 +556,7 @@ cmd_score(){
 
   local winner; winner=$(printf '%s' "$resp" | jq -r '.winner // empty' 2>/dev/null || true)
   if ! printf '%s' "$resp" | jq -e '.rankings[0].name' >/dev/null 2>&1; then
-    _score_independent "$cwin" "$prompt" "${panes[@]}"   # couldn't parse -> per-agent fallback
+    _score_independent "$cwin" "$prompt" "$base" "${panes[@]}"   # couldn't parse -> per-agent fallback
     return 0
   fi
 
@@ -594,6 +619,14 @@ cmd_send(){
   echo "wtcp: sent to $n agent(s)"
 }
 
+cmd_send_buffer(){
+  need_tmux
+  local text
+  text=$(tmux show-buffer -b wtcp-send 2>/dev/null || true)
+  [ -n "$text" ] || die 'send-all prompt was empty'
+  cmd_send "$text"
+}
+
 cmd_pick(){
   need_tmux
   local cwin fp winner; cwin=$(tmux display -p '#{window_id}'); fp=$(tmux display -p '#{pane_id}')
@@ -609,7 +642,8 @@ cmd_pick(){
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
     local msg; msg=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
     echo "wtcp: auto-committing the winner's uncommitted changes..."
-    git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" || true
+    git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" \
+      || die "auto-commit failed for [$winner]; merge aborted so the worktree is preserved"
   fi
   echo "wtcp: winner [$winner] -> merge to main / cleanup: ${losers[*]:-(none)}"
   _wm merge "$winner" || die "merge failed (resolve conflicts)"
@@ -634,10 +668,10 @@ cmd_setup(){
   # Ctrl+letter variant passes through the Korean IME (the bare letters get
   # composed into Hangul), so prefix -> C-p etc. work without switching input.
   local k
-  for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE pick"; done
-  for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE drop"; done
-  for k in R C-r; do tmux bind-key "$k" run-shell "$INVOKE score"; done
-  for k in S C-s; do tmux bind-key "$k" command-prompt -p 'send-all:' "run-shell \"$INVOKE send '%%'\""; done
+  for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE_Q pick"; done
+  for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE_Q drop"; done
+  for k in R C-r; do tmux bind-key "$k" run-shell "$INVOKE_Q score"; done
+  for k in S C-s; do tmux bind-key "$k" command-prompt -p 'send-all:' "set-buffer -b wtcp-send -- \"%%%\" \\; run-shell \"$INVOKE_Q send-buffer\""; done
   # Make the small grid panes reviewable: mouse-wheel scroll + vi paging
   # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
   tmux set -g mouse on
@@ -684,6 +718,7 @@ cmd_clean(){
 case "${1:-}" in
   start|broadcast|b) shift; cmd_broadcast "$@";;
   send|s)            shift; cmd_send "$@";;
+  send-buffer)       shift; cmd_send_buffer "$@";;
   pick|p)            shift; cmd_pick "$@";;
   fork|f)            shift; cmd_fork "$@";;
   drop|x)            shift; cmd_drop "$@";;
