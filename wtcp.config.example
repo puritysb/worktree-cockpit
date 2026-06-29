@@ -18,14 +18,25 @@ COCKPIT_JUDGE_URL="http://localhost:11434/v1/chat/completions"
 # COCKPIT_JUDGE_AUTH="Bearer sk-..."
 COCKPIT_JUDGE_AUTH=""
 
+# How much context the judge sees. `wtcp score` compares ALL agents in one call;
+# COMPARE_CHARS is the total evidence budget split across them. OUTPUT/DIFF_CHARS
+# bound a single agent. Raise for a bigger-context judge, lower for a small local
+# one (char ~ 1/3-1/4 token; keep the total under the model's window).
+COCKPIT_JUDGE_OUTPUT_CHARS=16000
+COCKPIT_JUDGE_DIFF_CHARS=16000
+COCKPIT_JUDGE_COMPARE_CHARS=48000
+COCKPIT_JUDGE_TIMEOUT=120
+
 # Branch-name generator from the prompt: fm (Apple Intelligence, macOS, on-device)
 # | mlx (local LLM via COCKPIT_NAMER_URL) | off (ASCII slug of the prompt).
 COCKPIT_NAMER="fm"
 COCKPIT_NAMER_URL="http://localhost:11434/v1/chat/completions"
 
-# OPT-IN. 1 = launch agents with their folder-trust/permission/sandbox bypass
-# flags so a brand-new project auto-starts instead of stopping at "Do you trust
-# this folder?". This disarms the agents' approval/sandbox gates (they auto-
-# approve all tool use) AND edits the global workmux config, so it is OFF by
-# default. Enable only for repos you trust.
+# OPT-IN. 1 = auto-start brand-new projects: pre-seed each agent's folder-trust
+# store (so "Do you trust this folder?" is skipped) AND launch in an unattended
+# permission mode (claude --permission-mode auto; codex bypass). Edits the agents'
+# trust stores + the global workmux config, so it is OFF by default. Trusted repos only.
 COCKPIT_TRUST=0
+# Override how claude/codex launch under COCKPIT_TRUST=1 (defaults shown):
+# COCKPIT_CLAUDE_CMD="claude --permission-mode auto"
+# COCKPIT_CODEX_CMD="codex --dangerously-bypass-approvals-and-sandbox"

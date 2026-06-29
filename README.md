@@ -104,11 +104,22 @@ WIP), `wtcp abandon` (discard a review-only round), `wtcp grid`, `wtcp list`,
 
 ## How scoring works
 
-`wtcp score` asks an LLM (your `COCKPIT_JUDGE_URL`) to rate each agent 0–10 with
-a one-line reason. It judges the **diff vs `main`** when the task produced code,
-or the agent's **terminal output** when it didn't (conversational/analysis
-tasks) — so non-code tasks are scored fairly too. It's a lightweight, on-demand
-judge, independent of any external eval system.
+`wtcp score` sends **all agents to the LLM (`COCKPIT_JUDGE_URL`) in one call** so
+it compares them head-to-head: it scores each 0–10 with a reason relative to the
+others and names a 🏆 **winner**. It weighs the **diff vs `main`** when the task
+produced code, or the agent's **terminal output** when it didn't (analysis tasks)
+— so non-code tasks are scored fairly too. The popup shows the ranking + winner +
+a comparison; each pane border gets its ★score. It's a lightweight, on-demand
+judge, independent of any external eval system. (Falls back to independent
+per-agent scoring if the comparison can't be parsed.)
+
+The judge sees as much context as fits its window — the full diff plus each
+agent's whole pane scrollback, budgeted by the `*_CHARS` vars below.
+
+## Grid layout
+
+The compare set is capped at **6 agents**. Panes are arranged: 2→`1×2`, 3→`1×3`,
+4→`2×2`, 5→`2×3` (one blank bottom-right), 6→`2×3`.
 
 ## Configuration
 
@@ -117,17 +128,33 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `COCKPIT_AGENTS` | `claude codex opencode` | agents compared by `wtcp start` |
+| `COCKPIT_AGENTS` | `claude codex opencode` | agents compared by `wtcp start` (max 6) |
 | `COCKPIT_JUDGE_URL` | `localhost:11434/v1/chat/completions` | LLM endpoint for `wtcp score` |
-| `COCKPIT_JUDGE_AUTH` | _(empty)_ | `Authorization` header value for hosted endpoints, e.g. `Bearer sk-...` (namer reuses it) |
+| `COCKPIT_JUDGE_AUTH` | _(empty)_ | `Authorization` header for hosted endpoints, e.g. `Bearer sk-...` (namer reuses it) |
+| `COCKPIT_JUDGE_OUTPUT_CHARS` | `16000` | per-agent terminal-output budget sent to the judge |
+| `COCKPIT_JUDGE_DIFF_CHARS` | `16000` | per-agent diff budget |
+| `COCKPIT_JUDGE_COMPARE_CHARS` | `48000` | total evidence budget for comparative scoring (split across agents) |
+| `COCKPIT_JUDGE_TIMEOUT` | `120` | seconds per judge request |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
-| `COCKPIT_TRUST` | `0` | **opt-in**: launch agents with trust/permission bypass so new projects auto-start (disarms approval/sandbox gates; edits the global workmux config) |
+| `COCKPIT_TRUST` | `0` | **opt-in**: skip the per-agent folder-trust dialog + auto-approve tool use so new projects auto-start (edits the agents' trust stores + global workmux config) |
+| `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD` | _(see below)_ | override how claude/codex launch under `COCKPIT_TRUST` |
+
+Raise the `*_CHARS` budgets for a bigger-context judge model; lower them for a
+small local one (char ≈ ⅓–¼ token, so keep the total under the model's window).
 
 ### `COCKPIT_TRUST` — auto-starting new projects
 
 By default, agents show their "Do you trust this folder?" prompt on a new
-project — confirm once and that repo auto-starts thereafter. Setting
-`COCKPIT_TRUST=1` launches claude/codex/agy with their `--dangerously-*` flags so
-even the first round starts unattended. **This auto-approves all tool use and
-disables the sandbox**, and it edits your global workmux config, so it is off by
-default. Enable it only for repositories you trust.
+project — confirm once and that repo auto-starts thereafter. `COCKPIT_TRUST=1`
+makes even the first round start unattended by doing two things before the round:
+
+- **Pre-seeding each agent's folder-trust store** so the trust dialog is skipped
+  (claude → `~/.claude.json`, codex → `~/.codex/config.toml`). agy is left to a
+  one-time manual accept — its store lives under `~/.gemini`.
+- **Launching agents in an unattended permission mode** so they don't pause on
+  every tool prompt: claude in `--permission-mode auto` (not full bypass), codex
+  with `--dangerously-bypass-approvals-and-sandbox`. Override either with
+  `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD`.
+
+This edits the agents' trust stores and the global workmux config, so it is off
+by default. Enable it only for repositories you trust.
