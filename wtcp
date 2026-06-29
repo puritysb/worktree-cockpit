@@ -55,7 +55,13 @@ INVOKE="${COCKPIT_INVOKE:-$(command -v wtcp || echo "$SELF")}"
 
 die(){ echo "wtcp: $*" >&2; exit 1; }
 _sh_quote(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-INVOKE_Q=$(_sh_quote "$INVOKE")
+if [ -n "${COCKPIT_INVOKE:-}" ]; then
+  # COCKPIT_INVOKE is a shell command prefix, not necessarily a single path:
+  # e.g. `env WTCP_CONFIG=... /path/to/wtcp`.
+  INVOKE_CMD="$COCKPIT_INVOKE"
+else
+  INVOKE_CMD=$(_sh_quote "$INVOKE")
+fi
 # workmux goes interactive when its stdin is a TTY and can then BLOCK waiting for
 # input — even with -f — e.g. for raw-string agents (created by COCKPIT_TRUST or
 # used by agy) on `add`, and a select UI on `remove`. Run every workmux call with
@@ -459,7 +465,7 @@ cmd_abandon(){
 # whole pane scrollback, each capped by these budgets (raise for a bigger-context
 # judge model; lower for a small local one). char ~ 1/3-1/4 token.
 : "${COCKPIT_JUDGE_OUTPUT_CHARS:=16000}"   # tail of each agent's terminal output
-: "${COCKPIT_JUDGE_DIFF_CHARS:=16000}"     # diff vs main
+: "${COCKPIT_JUDGE_DIFF_CHARS:=16000}"     # diff vs round base
 : "${COCKPIT_JUDGE_TIMEOUT:=120}"          # seconds per judge request (more context = slower)
 # Comparative scoring (wtcp score) sends ALL agents in one call; this is the
 # TOTAL evidence budget split across them (per-agent = this / (agents*2)), kept
@@ -606,10 +612,9 @@ cmd_agents(){
   _ensure_agent_configs
 }
 
-cmd_send(){
-  need_tmux
-  local text="${1:-}"; [ -n "$text" ] || die 'send "<text>"'
-  local cwin; cwin=$(tmux display -p '#{window_id}')
+_send_to_window(){
+  local cwin="$1" text="$2"
+  tmux list-panes -t "$cwin" >/dev/null 2>&1 || die "target window not found: $cwin"
   local n=0 p wt
   while IFS= read -r p; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] || continue          # skip the bar/empty pane
@@ -619,12 +624,27 @@ cmd_send(){
   echo "wtcp: sent to $n agent(s)"
 }
 
-cmd_send_buffer(){
+cmd_send(){
   need_tmux
-  local text
-  text=$(tmux show-buffer -b wtcp-send 2>/dev/null || true)
+  local text="${1:-}"; [ -n "$text" ] || die 'send "<text>"'
+  local cwin; cwin=$(tmux display -p '#{window_id}')
+  _send_to_window "$cwin" "$text"
+}
+
+cmd_prompt_send(){
+  need_tmux
+  local cwin="${1:-}" text
+  if [ -z "$cwin" ] || ! tmux list-panes -t "$cwin" >/dev/null 2>&1; then
+    cwin=$(tmux display -p '#{window_id}')
+  fi
+  if [ -t 0 ]; then
+    printf 'send-all: ' > /dev/tty
+    IFS= read -r text < /dev/tty || die 'send-all canceled'
+  else
+    IFS= read -r text || die 'send-all canceled'
+  fi
   [ -n "$text" ] || die 'send-all prompt was empty'
-  cmd_send "$text"
+  _send_to_window "$cwin" "$text"
 }
 
 cmd_pick(){
@@ -668,10 +688,10 @@ cmd_setup(){
   # Ctrl+letter variant passes through the Korean IME (the bare letters get
   # composed into Hangul), so prefix -> C-p etc. work without switching input.
   local k
-  for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE_Q pick"; done
-  for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE_Q drop"; done
-  for k in R C-r; do tmux bind-key "$k" run-shell "$INVOKE_Q score"; done
-  for k in S C-s; do tmux bind-key "$k" command-prompt -p 'send-all:' "set-buffer -b wtcp-send -- \"%%%\" \\; run-shell \"$INVOKE_Q send-buffer\""; done
+  for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE_CMD pick"; done
+  for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE_CMD drop"; done
+  for k in R C-r; do tmux bind-key "$k" run-shell "$INVOKE_CMD score"; done
+  for k in S C-s; do tmux bind-key "$k" display-popup -E "$INVOKE_CMD prompt-send"; done
   # Make the small grid panes reviewable: mouse-wheel scroll + vi paging
   # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
   tmux set -g mouse on
@@ -718,7 +738,7 @@ cmd_clean(){
 case "${1:-}" in
   start|broadcast|b) shift; cmd_broadcast "$@";;
   send|s)            shift; cmd_send "$@";;
-  send-buffer)       shift; cmd_send_buffer "$@";;
+  prompt-send)       shift; cmd_prompt_send "$@";;
   pick|p)            shift; cmd_pick "$@";;
   fork|f)            shift; cmd_fork "$@";;
   drop|x)            shift; cmd_drop "$@";;
