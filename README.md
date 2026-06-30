@@ -144,6 +144,11 @@ per-agent scoring if the comparison can't be parsed.)
 The judge sees as much context as fits its window — the full diff plus each
 agent's whole pane scrollback, budgeted by the `*_CHARS` vars below.
 
+The report writes each agent's **reason/summary in the same language as your
+prompt** (the judge mirrors the task's language; scores, names and the structural
+labels stay as-is) and shows a `Judge model:` line naming the model the endpoint
+actually used.
+
 ## Grid layout
 
 The compare set is capped at **6 agents**. Panes are arranged: 2→`1×2`, 3→`1×3`,

@@ -489,38 +489,41 @@ _wt_diff(){   # $1=worktree path $2=base ref -> diff vs base (tracked + untracke
   } | head -c "$COCKPIT_JUDGE_DIFF_CHARS"
 }
 
-_judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason"
-  local path="$1" prompt="$2" pane="$3" base="${4:-}" diff out req resp score reason
+_judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason|model"
+  local path="$1" prompt="$2" pane="$3" base="${4:-}" diff out req raw resp model score reason
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   [ -n "$path" ] && diff=$(_wt_diff "$path" "$base") || diff=""
   # Whole pane scrollback (history-limit is raised in setup), trimmed to budget.
   out=$(tmux capture-pane -p -S - -t "$pane" 2>/dev/null | tail -c "$COCKPIT_JUDGE_OUTPUT_CHARS")
   req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" \
-    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2}')
-  resp=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}. Write the \"reason\" value in the SAME LANGUAGE as the Task below; keep the JSON keys in English.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2}')
+  raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
+  model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
+  resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
   score=$(printf '%s' "$resp" | jq -r '.score // empty' 2>/dev/null || true)
   reason=$(printf '%s' "$resp" | jq -r '.reason // empty' 2>/dev/null || true)
   if [ -z "$score" ]; then   # model wrapped JSON in prose — extract best-effort
     score=$(printf '%s' "$resp" | grep -oE '"score"[: ]*[0-9.]+' | grep -oE '[0-9.]+' | head -1)
     reason=$(printf '%s' "$resp" | sed -n 's/.*"reason"[: ]*"\([^"]*\)".*/\1/p' | head -1)
   fi
-  printf '%s|%s' "${score:-?}" "${reason:-(no judgment — is the judge LLM running?)}"
+  printf '%s|%s|%s' "${score:-?}" "${reason:-(no judgment — is the judge LLM running?)}" "${model:-(unknown)}"
 }
 
 # Fallback: judge each agent independently (used if comparative parsing fails).
 _score_independent(){
   local cwin="$1" prompt="$2" base="$3"; shift 3
-  local p wt path res sc reason summary=""
+  local p wt path res rest sc reason model="" summary=""
   for p in "$@"; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
     path=$(_wt_path "$wt")
-    res=$(_judge_one "$path" "$prompt" "$p" "$base"); sc="${res%%|*}"; reason="${res#*|}"
+    res=$(_judge_one "$path" "$prompt" "$p" "$base")   # "score|reason|model"; model is the last field
+    sc="${res%%|*}"; rest="${res#*|}"; model="${rest##*|}"; reason="${rest%|*}"
     tmux set-option -p -t "$p" @pane_label "$wt   ★ $sc"
     tmux set-option -p -t "$p" @judge_reason "$reason"
     summary="${summary}★ ${sc}   ${wt}\n    ${reason}\n\n"
   done
   local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
-  { printf 'Task: %s\n\n' "${prompt:-(unknown)}"; printf '%b' "$summary"; } > "$F" 2>/dev/null || true
+  { printf 'Task: %s\n' "${prompt:-(unknown)}"; printf 'Judge model: %s\n\n' "${model:-(unknown)}"; printf '%b' "$summary"; } > "$F" 2>/dev/null || true
   tmux display-popup -E -w 82% -h 60% "${PAGER:-less} '$F'" 2>/dev/null || true
 }
 
@@ -556,22 +559,26 @@ cmd_score(){
 
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   local instr req resp
-  instr="You are a rigorous, skeptical senior engineer comparing several agents that each attempted the SAME task. Compare them head-to-head on correctness, completeness, depth, and actionability. Where there is a code Diff, weigh its correctness most; for analysis/research tasks (empty diff) judge the substance and accuracy of the Output. Be calibrated and discriminating: spread the scores so the ranking is meaningful, reserve 9-10 for genuinely complete and correct work, and penalize wrong claims, vagueness, or unfinished work. Use only the evidence shown. Return STRICT JSON only, no prose: {\"rankings\":[{\"name\":\"<exact agent name>\",\"score\":N,\"reason\":\"1-2 sentences comparing it to the others\"}],\"winner\":\"<exact name>\",\"summary\":\"2-3 sentences on why the winner beat the rest\"}. Include EVERY agent in rankings, best first, name copied EXACTLY."
+  instr="You are a rigorous, skeptical senior engineer comparing several agents that each attempted the SAME task. Compare them head-to-head on correctness, completeness, depth, and actionability. Where there is a code Diff, weigh its correctness most; for analysis/research tasks (empty diff) judge the substance and accuracy of the Output. Be calibrated and discriminating: spread the scores so the ranking is meaningful, reserve 9-10 for genuinely complete and correct work, and penalize wrong claims, vagueness, or unfinished work. Use only the evidence shown. Return STRICT JSON only, no prose: {\"rankings\":[{\"name\":\"<exact agent name>\",\"score\":N,\"reason\":\"1-2 sentences comparing it to the others\"}],\"winner\":\"<exact name>\",\"summary\":\"2-3 sentences on why the winner beat the rest\"}. Include EVERY agent in rankings, best first, name copied EXACTLY. Write all \"reason\" and \"summary\" values in the SAME LANGUAGE as the Task below; keep the JSON keys in English and copy agent names exactly as given."
   req=$(jq -nc --arg s "$instr" --arg t "${prompt:-(unknown task)}" --arg b "$blocks" \
     '{messages:[{role:"user",content:($s + "\n\nTask: " + $t + "\n\nAGENTS (compare these):" + $b)}],max_tokens:700,temperature:0.2}')
-  resp=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+  local raw model
+  raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
+  model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
+  resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
 
   local winner; winner=$(printf '%s' "$resp" | jq -r '.winner // empty' 2>/dev/null || true)
   if ! printf '%s' "$resp" | jq -e '.rankings[0].name' >/dev/null 2>&1; then
-    _score_independent "$cwin" "$prompt" "$base" "${panes[@]}"   # couldn't parse -> per-agent fallback
+    _score_independent "$cwin" "$prompt" "$base" "${panes[@]}"   # couldn't parse -> per-agent fallback (re-judges, reports its own model)
     return 0
   fi
 
   # Write the comparative report (jq formats the whole file).
   local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
-  printf '%s' "$resp" | jq -r --arg task "${prompt:-(unknown)}" '
+  printf '%s' "$resp" | jq -r --arg task "${prompt:-(unknown)}" --arg model "${model:-(unknown)}" '
     .winner as $w
-    | "Task: \($task)\n\n"
+    | "Task: \($task)\n"
+      + "Judge model: \($model)\n\n"
       + (if $w then "🏆 Winner: \($w)\n\n" else "" end)
       + ((.summary // "") | if . != "" then . + "\n\n" else "" end)
       + ([.rankings[] | "★ \(.score)   \(.name)\(if .name==$w then "   🏆" else "" end)\n    \(.reason)\n"] | join("\n"))
