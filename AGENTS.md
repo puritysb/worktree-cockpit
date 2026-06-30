@@ -86,9 +86,10 @@ This file is the design/gotcha memory for working ON wtcp itself.
 
 Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
 `COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`, `COCKPIT_AGY_DELAY`.
-Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`.
+Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_AUTH`,
+`COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
 Judge: `COCKPIT_JUDGE_URL`, `COCKPIT_JUDGE_AUTH` (Authorization header for hosted
-endpoints; namer reuses it via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_OUTPUT_CHARS`,
+endpoints; namer reuses it by default via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_OUTPUT_CHARS`,
 `COCKPIT_JUDGE_DIFF_CHARS`, `COCKPIT_JUDGE_COMPARE_CHARS`, `COCKPIT_JUDGE_TIMEOUT`.
 Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path).
 
