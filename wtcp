@@ -15,6 +15,7 @@
 #   wtcp list                           ls                    list active worktrees
 #   wtcp clean                          clear                 remove ALL compare worktrees + close grid windows
 #   wtcp setup                                                (re)install the in-grid keys + mouse (auto-run by `start`)
+#   wtcp doctor                                               check tmux/mouse/agents/deps + print troubleshooting tips
 #
 # IN-GRID KEYS — press your tmux prefix, then:
 #   Ctrl-P pick   ·   Ctrl-X drop   ·   Ctrl-R score-all   ·   Ctrl-S send-all
@@ -304,7 +305,7 @@ _run_round(){
     tries=$((tries+1)); [ "$tries" -ge "$maxtries" ] && break
     sleep 0.3
   done
-  [ "${found_count:-0}" -eq "$nag" ] || die "expected $nag worktree windows for '$task', found ${found_count:-0} (workmux add incomplete?)"
+  [ "${found_count:-0}" -eq "$nag" ] || die "expected $nag worktree windows for '$task', found ${found_count:-0} — an agent likely failed to launch (check each of [$COCKPIT_AGENTS] is installed + authenticated, and custom names are defined in ~/.config/workmux/config.yaml; run 'wtcp doctor')"
 
   # Grid window: pull each agent pane in with join-pane (pane_id is stable across the move).
   local cwin ph
@@ -694,7 +695,12 @@ cmd_setup(){
   for k in S C-s; do tmux bind-key "$k" display-popup -E "$INVOKE_CMD prompt-send"; done
   # Make the small grid panes reviewable: mouse-wheel scroll + vi paging
   # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
-  tmux set -g mouse on
+  # `mouse on` is tmux >= 2.1; fall back to the pre-2.1 mode-* options so very old
+  # tmux still gets click-to-select + wheel scroll. (If the mouse still doesn't
+  # work, it's the terminal/session layer, not this — see `wtcp doctor`.)
+  tmux set -g mouse on 2>/dev/null \
+    || { tmux set -g mode-mouse on 2>/dev/null; tmux set -g mouse-select-pane on 2>/dev/null; tmux set -g mouse-select-window on 2>/dev/null; } \
+    || true
   tmux setw -g mode-keys vi
   # Keep lots of scrollback so `wtcp score` can feed the judge each agent's whole
   # session (set before the agent panes are created, so they inherit it).
@@ -711,6 +717,52 @@ cmd_grid(){
   local w; w=$(tmux list-windows -F '#{window_id} #{window_name}' | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}' | tail -1)
   [ -n "$w" ] || die "no active grid (run 'wtcp start' first)"
   tmux select-window -t "$w"
+}
+
+# Environment / compatibility check. Prints what wtcp depends on so you can see
+# why the grid, mouse, or per-pane scroll misbehaves on a given machine/terminal.
+# Safe to run anywhere (does not need to be inside a grid).
+cmd_doctor(){
+  echo "wtcp doctor — environment check"
+  echo
+  local tv; tv=$(tmux -V 2>/dev/null | awk '{print $2}' || true)
+  printf '  tmux             %s\n' "${tv:-(not found)}"
+  if [ -n "${TMUX:-}" ]; then
+    printf '  inside tmux      yes\n'
+    printf '  mouse            %s   (need: on)\n' "$(tmux show -gv mouse 2>/dev/null || echo '?')"
+    printf '  mode-keys        %s\n' "$(tmux show -gwv mode-keys 2>/dev/null || echo '?')"
+    printf '  history-limit    %s\n' "$(tmux show -gv history-limit 2>/dev/null || echo '?')"
+    local ct; ct=$(tmux display -p '#{client_termname}' 2>/dev/null || true)
+    printf '  client TERM      %s\n' "${ct:-(no client attached)}"
+    case "$ct" in
+      "")            printf '  nesting          (attach a client to judge nesting)\n';;
+      screen*|tmux*) printf '  nesting          LIKELY NESTED (client runs inside another tmux/screen).\n                   Mouse often will not reach this inner tmux. Detach the outer\n                   tmux or connect from a bare terminal, then re-run.\n';;
+      *)             printf '  nesting          no (single tmux layer)\n';;
+    esac
+  else
+    printf '  inside tmux      NO  — run wtcp inside a tmux session\n'
+  fi
+  printf '  TERM             %s\n' "${TERM:-(unset)}"
+  echo
+  printf '  invoke (keys)    %s\n' "$INVOKE"
+  printf '  wtcp config      %s\n' "$( [ -f "$WTCP_CONFIG" ] && echo "$WTCP_CONFIG" || echo "(none — using defaults)" )"
+  printf '  agents           %s\n' "$COCKPIT_AGENTS"
+  local a p
+  for a in $COCKPIT_AGENTS; do
+    p=$(command -v "$a" 2>/dev/null || true)
+    if [ -n "$p" ]; then printf '    %-14s %s\n' "$a" "$p"
+    else printf '    %-14s not on PATH (ok if custom/defined in ~/.config/workmux/config.yaml)\n' "$a"; fi
+  done
+  echo
+  local t miss=""
+  for t in tmux workmux git jq curl; do command -v "$t" >/dev/null 2>&1 || miss="$miss$t "; done
+  if [ -n "$miss" ]; then printf '  deps             MISSING: %s\n' "$miss"
+  else printf '  deps             tmux workmux git jq curl (all present)\n'; fi
+  echo
+  echo "  Mouse / per-pane scroll / keys misbehaving? Detach tmux (prefix d) and"
+  echo "  re-run 'wtcp start' (or 'wtcp setup'). A long-lived session can leave the"
+  echo "  terminal's mouse-reporting state stale; detaching re-initializes it. This"
+  echo "  is the usual fix when the same setup works on one machine but not another."
 }
 
 cmd_list(){ _wm list; }
@@ -747,6 +799,7 @@ case "${1:-}" in
   score|r)           shift; cmd_score "$@";;
   agents)            shift; cmd_agents "$@";;
   setup)             shift; cmd_setup "$@";;
+  doctor)            shift; cmd_doctor "$@";;
   list|ls)           shift; cmd_list "$@";;
   clean|clear)       shift; cmd_clean "$@";;
   ""|-h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$SELF";;

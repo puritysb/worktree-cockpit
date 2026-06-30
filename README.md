@@ -100,7 +100,35 @@ Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
 Other commands: `wtcp send "..."`, `wtcp fork "..."` (new round from a pane's
 WIP), `wtcp abandon` (discard a review-only round), `wtcp grid`, `wtcp list`,
-`wtcp clean`. Run `wtcp help` for the full list.
+`wtcp clean`, `wtcp doctor` (environment check). Run `wtcp help` for the full list.
+
+## Troubleshooting
+
+Run **`wtcp doctor`** first — it reports tmux version, the live `mouse`/`mode-keys`
+state, whether you're in a nested tmux, the configured agents (and whether their
+CLIs are on `PATH`), and missing dependencies.
+
+**Mouse, per-pane scroll, or the in-grid keys don't work** (works on one machine
+but not another): the quickest fix is to **detach tmux (`prefix d`) and re-run
+`wtcp start`** (or just `wtcp setup`). `wtcp` sets `mouse on` and the keybindings
+as *server-global* options, but a long-lived tmux session can leave the terminal's
+mouse-reporting state stale — detaching re-initializes it. Also check:
+
+- **Nested tmux** (local tmux → ssh → remote tmux, or tmux-in-tmux): the outer
+  tmux eats mouse clicks/wheel so they never reach the inner one. Connect from a
+  bare terminal (no outer tmux) instead. `wtcp doctor` flags likely nesting.
+- **Terminal mouse reporting**: the emulator must forward mouse events. In iTerm2,
+  settings aren't synced across machines — compare **Settings → Pointer** and the
+  iTerm2 version on both. Don't use iTerm2's `tmux -CC` integration (different
+  mouse model); launch plain `tmux`.
+- **Old tmux** (< 2.1) uses `mode-mouse` instead of `mouse on`; `wtcp setup` falls
+  back to it automatically, but upgrading tmux is better.
+
+**The grid doesn't build / panes are missing** — usually an agent failed to
+launch. `wtcp start` now aborts with which agent count it expected vs. found.
+Make sure every name in `COCKPIT_AGENTS` is an installed, **authenticated** CLI
+(and, for custom agents, defined in `~/.config/workmux/config.yaml`). A too-small
+terminal window can also fail joins ("pane too small") — make the window bigger.
 
 ## How scoring works
 

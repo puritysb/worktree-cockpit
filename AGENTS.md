@@ -69,6 +69,18 @@ This file is the design/gotcha memory for working ON wtcp itself.
 8. **`wtcp clean` must remove worktrees BEFORE killing windows** — it is usually run
    from the grid's bottom bar pane, and killing that window would otherwise end the
    script before removal (the old "run clean twice" bug). Kills its own window last.
+9. **Mouse/keys are tmux SERVER-GLOBAL and the terminal's mouse-reporting state can
+   go stale.** `cmd_setup` sets `mouse on` + keybindings globally, but they don't fix
+   the layers above tmux. Symptom seen in the wild: identical config works on one
+   machine, not another — click-to-select-pane + wheel scroll dead even with
+   `mouse on`. Causes, in order of likelihood: (a) a long-lived tmux session whose
+   terminal mouse mode drifted → **detach (`prefix d`) + re-run** re-initializes it;
+   (b) **nested tmux** (outer tmux/ssh eats the mouse before the inner tmux sees it)
+   → use a bare terminal; (c) terminal emulator not forwarding mouse (iTerm2 prefs
+   aren't synced across Macs; avoid `tmux -CC` integration). `cmd_setup` also falls
+   back to pre-2.1 `mode-mouse` for ancient tmux. `wtcp doctor` surfaces all of this
+   (tmux version, live mouse/mode-keys, nesting heuristic via `#{client_termname}`,
+   agent CLIs on PATH, deps).
 
 ## Config vars (all `COCKPIT_*`, set in `~/.config/wtcp/config`)
 
