@@ -5,13 +5,16 @@
 # claude codex opencode gemini. Others (e.g. agy) are auto-configured by wtcp.
 COCKPIT_AGENTS="claude codex opencode"
 
-# LLM judge endpoint (OpenAI-compatible /chat/completions) used by `wtcp score`.
-# Pick ONE you actually run. Common local options (no API key, offline):
-#   Ollama:    http://localhost:11434/v1/chat/completions   (ollama pull qwen2.5-coder)
-#   LM Studio: http://localhost:1234/v1/chat/completions
-#   MLX:       http://localhost:8800/v1/chat/completions
-# Or a hosted endpoint, e.g. https://api.openai.com/v1/chat/completions
-COCKPIT_JUDGE_URL="http://localhost:11434/v1/chat/completions"
+# LLM judge endpoint used by `wtcp score`.
+# Set this to any OpenAI-compatible /chat/completions URL you actually run.
+# Examples:
+#   local server:  COCKPIT_JUDGE_URL="http://localhost:<port>/v1/chat/completions"
+#   hosted API:    COCKPIT_JUDGE_URL="https://api.example.com/v1/chat/completions"
+COCKPIT_JUDGE_URL=""
+
+# Model name sent to the judge endpoint. Most OpenAI-compatible servers require
+# this. Leave empty only if your endpoint supplies a default model server-side.
+COCKPIT_JUDGE_MODEL=""
 
 # Authorization header for hosted endpoints that need an API key (the namer
 # reuses it). Leave empty for local servers. Example:
@@ -28,9 +31,12 @@ COCKPIT_JUDGE_COMPARE_CHARS=48000
 COCKPIT_JUDGE_TIMEOUT=120
 
 # Branch-name generator from the prompt: fm (Apple Intelligence, macOS, on-device)
-# | mlx (local LLM via COCKPIT_NAMER_URL) | off (ASCII slug of the prompt).
+# | mlx (OpenAI-compatible endpoint) | off (ASCII slug of the prompt).
 COCKPIT_NAMER="fm"
-COCKPIT_NAMER_URL="http://localhost:11434/v1/chat/completions"
+# By default, namer endpoint/model/auth inherit the judge settings above.
+# Override only when branch naming should use a different endpoint/model.
+COCKPIT_NAMER_URL=""
+COCKPIT_NAMER_MODEL=""
 
 # OPT-IN. 1 = auto-start brand-new projects: pre-seed each agent's folder-trust
 # store (so "Do you trust this folder?" is skipped) AND launch in an unattended

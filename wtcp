@@ -5,7 +5,7 @@
 # COMMANDS                              alias   in-grid key   what it does
 #   wtcp start "<prompt>" [name]        b                     start a round: broadcast to every agent + build the grid
 #   wtcp score                          r       prefix Ctrl-R compare all agents with an LLM: rank + 🏆winner (★ on borders + popup)
-#   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into main (auto-commit), drop the rest
+#   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
 #   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
 #   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
 #   wtcp fork "<prompt>"                f                     start a new round from the focused agent's WIP (no merge)
@@ -24,7 +24,7 @@
 #   (Use Ctrl+letter — it passes through the Korean IME. Mouse wheel scrolls; click selects a pane.)
 #
 # You usually only TYPE `wtcp start "..."`; everything else is the in-grid keys above.
-# Config: ~/.config/wtcp/config  (COCKPIT_AGENTS, COCKPIT_JUDGE_URL, COCKPIT_TRUST, ...).
+# Config: ~/.config/wtcp/config  (COCKPIT_AGENTS, COCKPIT_JUDGE_URL, COCKPIT_JUDGE_MODEL, COCKPIT_TRUST, ...).
 set -euo pipefail
 
 # Load user config (agent set, endpoints, COCKPIT_TRUST, ...) before defaults.
@@ -103,12 +103,15 @@ _sanitize_slug(){
     | sed -E 's/-+/-/g; s/^-+//; s/-+$//' | cut -c1-28 | sed -E 's/-+$//'
 }
 # Prompt (any language) -> short english kebab branch name.
-#   COCKPIT_NAMER: fm (Apple Intelligence, default, on-device) | mlx (local Qwen3.6) | off.
-#   fm falls back to mlx, then to the prompt's ASCII letters.
+#   COCKPIT_NAMER: fm (Apple Intelligence, default, on-device) | mlx | off.
+#   fm falls back to an OpenAI-compatible endpoint if configured, then ASCII.
+: "${COCKPIT_JUDGE_URL:=}"
+: "${COCKPIT_JUDGE_MODEL:=}"
 : "${COCKPIT_NAMER:=fm}"
-: "${COCKPIT_NAMER_URL:=http://localhost:11434/v1/chat/completions}"
+: "${COCKPIT_NAMER_URL:=${COCKPIT_JUDGE_URL}}"
+: "${COCKPIT_NAMER_MODEL:=${COCKPIT_JUDGE_MODEL}}"
 # Authorization header VALUE for hosted endpoints, e.g. "Bearer sk-...". Empty =
-# no header (local servers like Ollama/MLX/LM Studio need none). NAMER inherits
+# no header (many local servers need none). NAMER inherits
 # JUDGE's value by default, so setting COCKPIT_JUDGE_AUTH alone covers both.
 : "${COCKPIT_JUDGE_AUTH:=}"
 : "${COCKPIT_NAMER_AUTH:=${COCKPIT_JUDGE_AUTH}}"
@@ -122,7 +125,7 @@ _self_dir(){
 : "${COCKPIT_FM_HELPER:=$(_self_dir)/assets/fm-helper/wtcp-fm-helper}"
 # Optional warm Apple-Intelligence endpoint (AgentDeck daemon, if running):
 # COCKPIT_DAEMON_PORT -> ~/.agentdeck/daemon.json httpPort -> 9120. Best-effort;
-# if nothing is listening, naming falls back to the FM binary, then MLX.
+# if nothing is listening, naming falls back to the FM binary, then the configured endpoint.
 : "${COCKPIT_DAEMON_PORT:=}"
 if [ -z "${COCKPIT_DAEMON_URL:-}" ]; then
   _p="${COCKPIT_DAEMON_PORT:-}"
@@ -146,8 +149,10 @@ _name_fm(){   # Apple Intelligence (FoundationModels)
 }
 _name_mlx(){
   local hdr=(); [ -n "${COCKPIT_NAMER_AUTH:-}" ] && hdr+=(-H "Authorization: $COCKPIT_NAMER_AUTH")
+  [ -n "${COCKPIT_NAMER_URL:-}" ] || return 0
   curl -s --max-time 8 "$COCKPIT_NAMER_URL" -H 'Content-Type: application/json' ${hdr[@]+"${hdr[@]}"} \
-    -d "$(jq -nc --arg p "$_NAME_INSTR$1" '{messages:[{role:"user",content:$p}],max_tokens:20,temperature:0.2}')" \
+    -d "$(jq -nc --arg p "$_NAME_INSTR$1" --arg m "${COCKPIT_NAMER_MODEL:-}" \
+      '{messages:[{role:"user",content:$p}],max_tokens:20,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')" \
     2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null || true
 }
 slugify(){
@@ -280,7 +285,7 @@ _apply_grid_layout(){
   tmux select-layout -t "$cwin" "${cs},${geo}" 2>/dev/null || tmux select-layout -t "$cwin" tiled 2>/dev/null || true
 }
 
-# One round: branch N agents from base (empty base = current main) + broadcast prompt + assemble grid.
+# One round: branch N agents from base + broadcast prompt + assemble grid.
 _run_round(){
   local prompt="$1" task="$2" base="${3:-}"
   _ensure_agent_configs   # agy wrapper + (COCKPIT_TRUST) tool-approval bypass flags for claude/codex
@@ -425,7 +430,7 @@ cmd_broadcast(){
   _run_round "$prompt" "$task" ""
 }
 
-# Branch a new round from the focused agent's (unmerged) WIP. No merge to main.
+# Branch a new round from the focused agent's unmerged WIP.
 cmd_fork(){
   need_tmux; need_repo
   local prompt="${1:-}"; [ -n "$prompt" ] || die 'fork "<prompt>" [name]'
@@ -457,11 +462,12 @@ cmd_abandon(){
 }
 
 # ===== Built-in judge =====
-# Calls an LLM endpoint (OpenAI-compatible; local Qwen via MLX by default) to
+# Calls a configured OpenAI-compatible LLM endpoint to
 # score each agent's work and explain why, on demand, from the diff + the agent's
 # recent output. COCKPIT_JUDGE_URL overrides the endpoint; COCKPIT_JUDGE_AUTH
 # adds an Authorization header for hosted endpoints.
-: "${COCKPIT_JUDGE_URL:=http://localhost:11434/v1/chat/completions}"
+: "${COCKPIT_JUDGE_URL:=}"
+: "${COCKPIT_JUDGE_MODEL:=}"
 # The judge sees as much context as fits its window: the full diff + the agent's
 # whole pane scrollback, each capped by these budgets (raise for a bigger-context
 # judge model; lower for a small local one). char ~ 1/3-1/4 token.
@@ -495,8 +501,8 @@ _judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason
   [ -n "$path" ] && diff=$(_wt_diff "$path" "$base") || diff=""
   # Whole pane scrollback (history-limit is raised in setup), trimmed to budget.
   out=$(tmux capture-pane -p -S - -t "$pane" 2>/dev/null | tail -c "$COCKPIT_JUDGE_OUTPUT_CHARS")
-  req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" \
-    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}. Write the \"reason\" value in the SAME LANGUAGE as the Task below; keep the JSON keys in English.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2}')
+  req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" --arg m "${COCKPIT_JUDGE_MODEL:-}" \
+    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}. Write the \"reason\" value in the SAME LANGUAGE as the Task below; keep the JSON keys in English.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
   raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
   resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
@@ -532,6 +538,10 @@ _score_independent(){
 # popup with the comparison. Falls back to independent scoring if it can't parse.
 cmd_score(){
   need_tmux; goto_root
+  if [ -z "${COCKPIT_JUDGE_URL:-}" ]; then
+    tmux display-message "wtcp: set COCKPIT_JUDGE_URL in ~/.config/wtcp/config to use scoring" 2>/dev/null || true
+    die "set COCKPIT_JUDGE_URL in ~/.config/wtcp/config to use scoring"
+  fi
   local cwin prompt base; cwin=$(tmux display -p '#{window_id}')
   prompt=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true)
   base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
@@ -560,8 +570,8 @@ cmd_score(){
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   local instr req resp
   instr="You are a rigorous, skeptical senior engineer comparing several agents that each attempted the SAME task. Compare them head-to-head on correctness, completeness, depth, and actionability. Where there is a code Diff, weigh its correctness most; for analysis/research tasks (empty diff) judge the substance and accuracy of the Output. Be calibrated and discriminating: spread the scores so the ranking is meaningful, reserve 9-10 for genuinely complete and correct work, and penalize wrong claims, vagueness, or unfinished work. Use only the evidence shown. Return STRICT JSON only, no prose: {\"rankings\":[{\"name\":\"<exact agent name>\",\"score\":N,\"reason\":\"1-2 sentences comparing it to the others\"}],\"winner\":\"<exact name>\",\"summary\":\"2-3 sentences on why the winner beat the rest\"}. Include EVERY agent in rankings, best first, name copied EXACTLY. Write all \"reason\" and \"summary\" values in the SAME LANGUAGE as the Task below; keep the JSON keys in English and copy agent names exactly as given."
-  req=$(jq -nc --arg s "$instr" --arg t "${prompt:-(unknown task)}" --arg b "$blocks" \
-    '{messages:[{role:"user",content:($s + "\n\nTask: " + $t + "\n\nAGENTS (compare these):" + $b)}],max_tokens:700,temperature:0.2}')
+  req=$(jq -nc --arg s "$instr" --arg t "${prompt:-(unknown task)}" --arg b "$blocks" --arg m "${COCKPIT_JUDGE_MODEL:-}" \
+    '{messages:[{role:"user",content:($s + "\n\nTask: " + $t + "\n\nAGENTS (compare these):" + $b)}],max_tokens:700,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
   local raw model
   raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
@@ -673,11 +683,11 @@ cmd_pick(){
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" \
       || die "auto-commit failed for [$winner]; merge aborted so the worktree is preserved"
   fi
-  echo "wtcp: winner [$winner] -> merge to main / cleanup: ${losers[*]:-(none)}"
+  echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
   _wm merge "$winner" || die "merge failed (resolve conflicts)"
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
   tmux kill-window -t "$cwin" 2>/dev/null || true
-  echo "wtcp: done. merged to main — keep working or start another round."
+  echo "wtcp: done. merged winner — keep working or start another round."
 }
 
 cmd_drop(){
@@ -753,6 +763,8 @@ cmd_doctor(){
   echo
   printf '  invoke (keys)    %s\n' "$INVOKE"
   printf '  wtcp config      %s\n' "$( [ -f "$WTCP_CONFIG" ] && echo "$WTCP_CONFIG" || echo "(none — using defaults)" )"
+  printf '  judge url        %s\n' "${COCKPIT_JUDGE_URL:-(unset; scoring disabled)}"
+  printf '  judge model      %s\n' "${COCKPIT_JUDGE_MODEL:-(unset)}"
   printf '  agents           %s\n' "$COCKPIT_AGENTS"
   local a p
   for a in $COCKPIT_AGENTS; do

@@ -8,8 +8,8 @@
 `wtcp` is a single Bash script (`./wtcp`, symlinked onto PATH by `install.sh`)
 that runs several coding agents on one prompt in an isolated tmux grid, then
 reviews, scores, and merges the best. It orchestrates **workmux + tmux + git**;
-the only "smart" dependency is an OpenAI-compatible LLM endpoint used for branch
-naming and scoring. See `README.md` for user-facing usage.
+the optional "smart" dependency is an OpenAI-compatible LLM endpoint used for
+scoring and, when configured, branch naming. See `README.md` for user-facing usage.
 
 This file is the design/gotcha memory for working ON wtcp itself.
 
@@ -86,11 +86,12 @@ This file is the design/gotcha memory for working ON wtcp itself.
 
 Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
 `COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`, `COCKPIT_AGY_DELAY`.
-Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_AUTH`,
-`COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
+Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_MODEL`,
+`COCKPIT_NAMER_AUTH`, `COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
 Judge: `COCKPIT_JUDGE_URL`, `COCKPIT_JUDGE_AUTH` (Authorization header for hosted
-endpoints; namer reuses it by default via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_OUTPUT_CHARS`,
-`COCKPIT_JUDGE_DIFF_CHARS`, `COCKPIT_JUDGE_COMPARE_CHARS`, `COCKPIT_JUDGE_TIMEOUT`.
+endpoints; namer reuses it by default via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_MODEL`,
+`COCKPIT_JUDGE_OUTPUT_CHARS`, `COCKPIT_JUDGE_DIFF_CHARS`, `COCKPIT_JUDGE_COMPARE_CHARS`,
+`COCKPIT_JUDGE_TIMEOUT`.
 Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path).
 
 ## Testing wtcp without real agents
@@ -115,5 +116,5 @@ interactive agents, not for the join/layout/score machinery.
 
 Required: `tmux`, `workmux` (`brew install raine/workmux/workmux`), `git`, `jq`,
 `curl`. Optional: the agent CLIs being compared, and a Node + Xcode toolchain to
-build the FM helper. Judge/namer need an OpenAI-compatible `/chat/completions`
-endpoint (local Ollama/MLX/LM Studio or hosted).
+build the FM helper. Scoring needs a configured OpenAI-compatible
+`/chat/completions` endpoint and, for most servers, a model name.
