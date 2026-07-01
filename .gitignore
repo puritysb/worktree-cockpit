@@ -6,3 +6,6 @@ assets/fm-helper/wtcp-fm-helper
 # workmux runtime hooks (leaked during testing)
 .github/hooks/
 .workmux/
+
+# generated output from scripts/record-feature-demo*.sh — regenerated per run
+demo-recordings/

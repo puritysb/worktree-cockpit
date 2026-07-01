@@ -518,6 +518,7 @@ cmd_abandon(){
 : "${COCKPIT_JUDGE_TIMEOUT:=120}"          # seconds per judge request (more context = slower)
 : "${COCKPIT_POPUP_WIDTH:=92%}"
 : "${COCKPIT_POPUP_HEIGHT:=85%}"
+: "${COCKPIT_NO_INTERACTIVE_MENUS:=0}"
 # Comparative scoring (wtcp score) sends ALL agents in one call; this is the
 # TOTAL evidence budget split across them (per-agent = this / (agents*2)), kept
 # small enough to fit the judge's context. Raise for a bigger-context model.
@@ -694,7 +695,7 @@ cmd_score(){
 
   _show_judge_report "$F" || true
   # After reading the report, offer a one-key winner pick that merges directly.
-  _winner_menu "$cwin"
+  [ "$COCKPIT_NO_INTERACTIVE_MENUS" = "1" ] || _winner_menu "$cwin"
 }
 
 # Show or set the agent set compared by `wtcp start` (persists to ~/.config/wtcp/config).
