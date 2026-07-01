@@ -98,6 +98,20 @@ This file is the design/gotcha memory for working ON wtcp itself.
    (tmux version, live mouse/mode-keys, nesting heuristic via `#{client_termname}`,
    agent CLIs on PATH, deps).
 
+## Design decisions (evaluated & rejected — don't re-litigate)
+
+- **iTerm2-native split-view backend — rejected (2026-07).** iTerm2 can split panes
+  via its Python API, but: (a) workmux only supports tmux/kitty/WezTerm/Zellij, so
+  going iTerm2-native means reimplementing workmux's fused worktree+window+launch
+  pipeline, not swapping a backend; (b) ~half of `wtcp` is raw tmux plumbing with
+  no abstraction seam (join-pane grid + layout checksum, prefix keybindings →
+  `$INVOKE`, display-menu/popup, `@pane_label` stamping, capture-pane scrollback
+  for the judge) with no iTerm2 analog; (c) iTerm2 is GUI-only — no headless
+  testing (breaks the fake-agent strategy above), no detach/ssh/Linux. iTerm2
+  remains supported as a *host terminal* for tmux. If tmux ever has to go, the
+  cheap path is a workmux-supported backend (WezTerm/kitty), not iTerm2.
+- Agent peer/cross-review — rejected; a stronger judge is config, not a feature.
+
 ## Config vars (all `COCKPIT_*`, set in `~/.config/wtcp/config`)
 
 Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD`,
