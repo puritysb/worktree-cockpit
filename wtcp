@@ -4,7 +4,10 @@
 #
 # COMMANDS                              alias   in-grid key   what it does
 #   wtcp start "<prompt>" [name]        b                     start a round: broadcast to every agent + build the grid
-#   wtcp score                          r       prefix Ctrl-R compare all agents with an LLM: rank + 🏆winner (★ on borders + popup)
+#   wtcp score                          r       prefix Ctrl-R compare all agents with an LLM: rank + winner (scores on borders + popup)
+#   wtcp show                                                 show the last judge report popup
+#   wtcp copy                           cp                    copy the last judge report to the clipboard
+#   wtcp winner                                 prefix Ctrl-R menu: pick the winning agent (best score first) -> merge it
 #   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
 #   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
 #   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
@@ -18,7 +21,7 @@
 #   wtcp doctor                                               check tmux/mouse/agents/deps + print troubleshooting tips
 #
 # IN-GRID KEYS — press your tmux prefix, then:
-#   Ctrl-P pick   ·   Ctrl-X drop   ·   Ctrl-R score-all   ·   Ctrl-S send-all
+#   Ctrl-P pick   ·   Ctrl-X drop   ·   Ctrl-R review menu   ·   Ctrl-S send-all
 #   z = fullscreen the focused agent (z again to return)   ·   arrows = move · o = cycle
 #   Ctrl-arrows = resize the focused agent (Alt-arrows = resize bigger steps)   ·   [ = scroll
 #   (Use Ctrl+letter — it passes through the Korean IME. Mouse wheel scrolls; click selects a pane.)
@@ -39,6 +42,7 @@ WTCP_CONFIG="${WTCP_CONFIG:-$HOME/.config/wtcp/config}"
 : "${COCKPIT_SENDKEYS_AGENTS:=}"
 : "${COCKPIT_SEND_DELAY:=0.4}"        # delay between paste and Enter (avoids codex submit race)
 : "${COCKPIT_AGY_DELAY:=4}"           # wait before send-keys-delivering to a non-builtin agent
+: "${COCKPIT_LAUNCH_TIMEOUT:=0}"      # seconds to wait for workmux windows; 0 = auto by agent count
 # OPT-IN: 1 = launch agents with their folder-trust/permission/sandbox bypass
 # flags so a brand-new project auto-starts. This disarms approval/sandbox gates
 # (the agents auto-approve all tool use) and edits the global workmux config, so
@@ -48,7 +52,7 @@ WIN_PREFIX="wt"
 BAR_HEIGHT=6
 # Always-visible shortcut cheatsheet (shown on the command-bar pane border).
 # Use Ctrl + the letter; the Ctrl variant passes through the Korean IME.
-BAR_KEYS='wtcp (prefix, then)   Ctrl-P pick · Ctrl-X drop · Ctrl-S send-all · Ctrl-R score-ALL      |      z = fullscreen one · arrows = move · [ = scroll'
+BAR_KEYS='wtcp (prefix, then)   Ctrl-P pick · Ctrl-X drop · Ctrl-S send-all · Ctrl-R review menu (score/pick-winner)      |      z = fullscreen one · arrows = move · [ = scroll'
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # Path the keybindings call back through. Prefer `wtcp` on PATH; fall back to this
 # script's absolute path. COCKPIT_INVOKE overrides (e.g. a wrapper command).
@@ -82,6 +86,25 @@ _send_to_pane(){
 }
 _current_ref(){
   git symbolic-ref --quiet --short HEAD 2>/dev/null || git rev-parse --short HEAD
+}
+_agent_env_key(){
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_' | sed -E 's/^_+//; s/_+$//'
+}
+_agent_cmd(){
+  local key var
+  key=$(_agent_env_key "$1"); var="COCKPIT_AGENT_${key}_CMD"
+  printf '%s' "${!var-}"
+}
+_agent_kind(){
+  local a="$1" key var kind
+  key=$(_agent_env_key "$a"); var="COCKPIT_AGENT_${key}_KIND"; kind="${!var-}"
+  if [ -n "$kind" ]; then printf '%s' "$kind"; return 0; fi
+  case "$a" in
+    claude|claude-*|claude_*) printf 'claude' ;;
+    codex|codex-*|codex_*)   printf 'codex' ;;
+    agy|agy-*|agy_*)         printf 'agy' ;;
+    *)                       printf '%s' "$a" ;;
+  esac
 }
 # Absolute worktree path (workmux path -> fallback to <repo>__worktrees/<wt>).
 _wt_path(){
@@ -169,9 +192,10 @@ slugify(){
 # Set/replace an agent's command in the workmux global agents map (idempotent).
 # (workmux honors overrides of builtin names and appends the prompt as -- "...".)
 _set_agent_cfg(){
-  local CFG="$HOME/.config/workmux/config.yaml" agent="$1" cmd="$2" line
+  local CFG="$HOME/.config/workmux/config.yaml" agent="$1" cmd="$2" line esc
   mkdir -p "$(dirname "$CFG")"; [ -f "$CFG" ] || printf 'nerdfont: true\n' > "$CFG"
-  line="  $agent: \"$cmd\""
+  esc="${cmd//\\/\\\\}"; esc="${esc//\"/\\\"}"
+  line="  $agent: \"$esc\""
   if grep -qE "^[[:space:]]*$agent:" "$CFG"; then
     awk -v a="$agent" -v w="$line" 'index($0,a":") && $0 ~ "^[[:space:]]*"a":" {print w; next} {print}' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
   elif grep -qE '^agents:' "$CFG"; then
@@ -195,16 +219,21 @@ _set_agent_cfg(){
 # Note: this edits the workmux GLOBAL config, so it also affects plain `workmux
 # -a claude/codex`. Set COCKPIT_TRUST=0 (default) to keep the safety prompts.
 _ensure_agent_configs(){
-  local a flag=""
+  local a flag="" kind cmd
   [ "${COCKPIT_TRUST:-0}" = 1 ] && flag="--dangerously-skip-permissions "
-  for a in $COCKPIT_AGENTS; do case "$a" in
+  for a in $COCKPIT_AGENTS; do
+    cmd=$(_agent_cmd "$a")
+    if [ -n "$cmd" ]; then _set_agent_cfg "$a" "$cmd"; continue; fi
+    kind=$(_agent_kind "$a")
+    case "$kind" in
     agy)
       local W="$HOME/.config/wtcp/agy-wm"; mkdir -p "$(dirname "$W")"
       printf '#!/bin/sh\np=$(cat .workmux/PROMPT-*.md 2>/dev/null)\nexec agy %s-i "$p"\n' "$flag" > "$W"; chmod +x "$W"
-      _set_agent_cfg agy "$W" ;;
-    claude) [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg claude "${COCKPIT_CLAUDE_CMD:-claude --permission-mode auto}" ;;
-    codex)  [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg codex "${COCKPIT_CODEX_CMD:-codex --dangerously-bypass-approvals-and-sandbox}" ;;
+      _set_agent_cfg "$a" "$W" ;;
+    claude) [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg "$a" "${COCKPIT_CLAUDE_CMD:-claude --permission-mode auto}" ;;
+    codex)  [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg "$a" "${COCKPIT_CODEX_CMD:-codex --dangerously-bypass-approvals-and-sandbox}" ;;
   esac; done
+  return 0
 }
 
 # COCKPIT_TRUST also pre-seeds each agent's own folder-trust store for the
@@ -229,12 +258,15 @@ _trust_claude(){  # $1 = worktree path (claude trusts the project cwd)
 }
 _pretrust(){      # $1 = task  $2 = repo root
   [ "${COCKPIT_TRUST:-0}" = 1 ] || return 0
-  local task="$1" root="$2" a wtbase
+  local task="$1" root="$2" a kind wtbase
   wtbase="$(dirname "$root")/$(basename "$root")__worktrees"
-  for a in $COCKPIT_AGENTS; do case "$a" in
+  for a in $COCKPIT_AGENTS; do
+    kind=$(_agent_kind "$a")
+    case "$kind" in
     codex)  _trust_codex "$root" ;;
-    claude) _trust_claude "$wtbase/$task-claude" ;;
+    claude) _trust_claude "$wtbase/$task-$a" ;;
   esac; done
+  return 0
 }
 
 # tmux layout checksum (pure bash; ord via printf "%d 'c").
@@ -295,22 +327,27 @@ _run_round(){
   local addargs=(); for a in $COCKPIT_AGENTS; do addargs+=(-a "$a"); done
   [ -n "$base" ] && addargs+=(--base "$base")
 
-  local nag tries=0 maxtries neww found_count
+  local nag neww found_count add_status=0 timeout_s deadline now
   nag=0; for a in $COCKPIT_AGENTS; do nag=$((nag+1)); done
   echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
-  _wm add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null
-  # workmux creates each worktree sequentially (~1.5-2s each), so poll until all
-  # agent windows have appeared rather than guessing a fixed sleep. Scale the
-  # timeout with the agent count (+slack).
-  maxtries=$(( nag * 14 + 10 ))
+  _wm add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null || add_status=$?
+  [ "$add_status" -eq 0 ] || echo "wtcp: workmux add returned $add_status; waiting for launched windows..."
+  # workmux creates each worktree sequentially and project hooks can make cold
+  # worktrees slow, so poll until all agent windows appear. Some successful
+  # launches still return non-zero (for example CLI notifier hooks); the window
+  # poll below is the source of truth.
+  timeout_s="${COCKPIT_LAUNCH_TIMEOUT:-0}"
+  case "$timeout_s" in ''|*[!0-9]*) timeout_s=0 ;; esac
+  [ "$timeout_s" -gt 0 ] || timeout_s=$(( nag * 60 + 30 ))
+  deadline=$(( $(date +%s) + timeout_s ))
   while :; do
     neww=$(_find_task_windows "$task")
     found_count=$(printf '%s\n' "$neww" | grep -c . || true)
     [ "$found_count" -ge "$nag" ] && break
-    tries=$((tries+1)); [ "$tries" -ge "$maxtries" ] && break
-    sleep 0.3
+    now=$(date +%s); [ "$now" -ge "$deadline" ] && break
+    sleep 1
   done
-  [ "${found_count:-0}" -eq "$nag" ] || die "expected $nag worktree windows for '$task', found ${found_count:-0} — an agent likely failed to launch (check each of [$COCKPIT_AGENTS] is installed + authenticated, and custom names are defined in ~/.config/workmux/config.yaml; run 'wtcp doctor')"
+  [ "${found_count:-0}" -eq "$nag" ] || die "expected $nag worktree windows for '$task', found ${found_count:-0} after ${timeout_s}s — an agent likely failed to launch (check each of [$COCKPIT_AGENTS] is installed + authenticated, and custom names are defined in ~/.config/workmux/config.yaml; run 'wtcp doctor')"
 
   # Grid window: pull each agent pane in with join-pane (pane_id is stable across the move).
   local cwin ph
@@ -400,7 +437,12 @@ _find_task_windows(){   # $1 = task; prints "<window-id> <worktree>" in COCKPIT_
       [ -n "$w" ] || continue
       name=$(tmux display-message -p -t "$w" '#{window_name}' 2>/dev/null || true)
       wt="${name##* }"
-      if [ "$wt" = "$want" ]; then found="$w"; break; fi
+      case "$name" in
+        "$want"|wm-"$want"|*" $want"|*" wm-$want") found="$w"; break ;;
+      esac
+      case "$wt" in
+        "$want"|wm-"$want") found="$w"; break ;;
+      esac
     done < <(tmux list-windows -F '#{window_id}')
     [ -n "$found" ] && printf '%s %s\n' "$found" "$want"
   done
@@ -474,6 +516,8 @@ cmd_abandon(){
 : "${COCKPIT_JUDGE_OUTPUT_CHARS:=16000}"   # tail of each agent's terminal output
 : "${COCKPIT_JUDGE_DIFF_CHARS:=16000}"     # diff vs round base
 : "${COCKPIT_JUDGE_TIMEOUT:=120}"          # seconds per judge request (more context = slower)
+: "${COCKPIT_POPUP_WIDTH:=92%}"
+: "${COCKPIT_POPUP_HEIGHT:=85%}"
 # Comparative scoring (wtcp score) sends ALL agents in one call; this is the
 # TOTAL evidence budget split across them (per-agent = this / (agents*2)), kept
 # small enough to fit the judge's context. Raise for a bigger-context model.
@@ -502,7 +546,7 @@ _judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason
   # Whole pane scrollback (history-limit is raised in setup), trimmed to budget.
   out=$(tmux capture-pane -p -S - -t "$pane" 2>/dev/null | tail -c "$COCKPIT_JUDGE_OUTPUT_CHARS")
   req=$(jq -nc --arg t "${prompt:-(unknown task)}" --arg d "${diff:-(none)}" --arg o "$out" --arg m "${COCKPIT_JUDGE_MODEL:-}" \
-    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating — reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. If there is a code Diff, weigh its correctness and quality most. If the Diff is empty (an analysis/research/conversational task), judge the substance and accuracy of the Output instead — do NOT penalize an empty diff. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"1-2 specific sentences naming what was strong and what was missing or wrong\"}. Write the \"reason\" value in the SAME LANGUAGE as the Task below; keep the JSON keys in English.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
+    '{messages:[{role:"user",content:("You are a rigorous, skeptical senior engineer reviewing ONE agent'"'"'s attempt at the task below. Score 0-10: 10 = thorough and correct, 7-8 = solid with gaps, 5 = mediocre/partial, 0-3 = wrong, hand-wavy, or unfinished. Be calibrated and discriminating: reserve 9-10 for genuinely complete, correct, well-reasoned work, and penalize incorrect claims, vagueness, or work left undone. Judge on correctness, completeness, depth, and actionability. Evaluate BOTH evidence streams: the code Diff is the source of truth for implementation quality when present, while terminal Output is evidence for tests run, claims made, analysis quality, and whether the agent noticed important issues. If the Diff is empty, judge the substance and accuracy of the Output instead; do NOT penalize an empty diff by itself. Do not reward or penalize the agent for answering in Korean vs English unless the task explicitly requires a language. Base your judgement only on the evidence shown. Return STRICT JSON only: {\"score\":N,\"reason\":\"one concise bullet-fragment style reason naming what was strong and what was missing or wrong\"}. Write the \"reason\" value in the SAME LANGUAGE as the Task below; keep the JSON keys in English.\nTask: " + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:400,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
   raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
   resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
@@ -513,6 +557,41 @@ _judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason
     reason=$(printf '%s' "$resp" | sed -n 's/.*"reason"[: ]*"\([^"]*\)".*/\1/p' | head -1)
   fi
   printf '%s|%s|%s' "${score:-?}" "${reason:-(no judgment — is the judge LLM running?)}" "${model:-(unknown)}"
+}
+
+_judge_file(){ printf '%s' "$HOME/.config/wtcp/judge.txt"; }
+_show_judge_report(){
+  local F="${1:-$(_judge_file)}" qF
+  [ -s "$F" ] || { tmux display-message "wtcp: no judge report yet" 2>/dev/null || true; return 1; }
+  qF=$(_sh_quote "$F")
+  # NOTE: no -F — with -F less quits immediately when the report fits one screen,
+  # which would make the popup flash and close. Keep it open until the user hits q.
+  tmux display-popup -E -w "$COCKPIT_POPUP_WIDTH" -h "$COCKPIT_POPUP_HEIGHT" "LESS='-R' ${PAGER:-less} $qF" 2>/dev/null || true
+}
+# Build an interactive "pick the winner to merge" menu from the live grid's scored
+# pane borders (best score first). Selecting an agent runs `wtcp pick <worktree>`.
+# No-ops when no client is attached (e.g. headless tests) or nothing is scored.
+_winner_menu(){
+  local cwin="$1" sess
+  sess=$(tmux display -p -t "$cwin" '#{session_id}' 2>/dev/null || true)
+  [ -n "$sess" ] && tmux list-clients -t "$sess" 2>/dev/null | grep -q . || return 0
+  local p wt label sc rows=()
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
+    label=$(tmux show-options -pqv -t "$p" @pane_label 2>/dev/null || true)
+    case "$label" in *"★ "*) sc="${label##*★ }"; sc="${sc%% *}";; *) sc="";; esac
+    case "$sc" in ''|*[!0-9.]*) sc="?";; esac
+    rows+=("$sc"$'\t'"$wt")
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  [ "${#rows[@]}" -gt 0 ] || return 0
+  local items=() s n idx=0 key qn
+  while IFS=$'\t' read -r s n; do
+    idx=$((idx+1)); key="$idx"; [ "$idx" -gt 9 ] && key=""
+    qn=$(_sh_quote "$n")
+    items+=("★ ${s}  ${n}" "$key" "run-shell \"$INVOKE_CMD pick $qn\"")
+  done < <(printf '%s\n' "${rows[@]}" | sort -t"$(printf '\t')" -k1,1 -rn)
+  items+=("" "" "" "Cancel" q "")
+  tmux display-menu -T "wtcp — pick winner to merge" "${items[@]}" 2>/dev/null || true
 }
 
 # Fallback: judge each agent independently (used if comparative parsing fails).
@@ -526,15 +605,15 @@ _score_independent(){
     sc="${res%%|*}"; rest="${res#*|}"; model="${rest##*|}"; reason="${rest%|*}"
     tmux set-option -p -t "$p" @pane_label "$wt   ★ $sc"
     tmux set-option -p -t "$p" @judge_reason "$reason"
-    summary="${summary}★ ${sc}   ${wt}\n    ${reason}\n\n"
+    summary="${summary}- ${wt}: ${sc}/10\n  - ${reason}\n"
   done
-  local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
-  { printf 'Task: %s\n' "${prompt:-(unknown)}"; printf 'Judge model: %s\n\n' "${model:-(unknown)}"; printf '%b' "$summary"; } > "$F" 2>/dev/null || true
-  tmux display-popup -E -w 82% -h 60% "${PAGER:-less} '$F'" 2>/dev/null || true
+  local F; F=$(_judge_file); mkdir -p "$(dirname "$F")"
+  { printf 'Task: %s\n' "${prompt:-(unknown)}"; printf 'Judge model: %s\n\n' "${model:-(unknown)}"; printf 'Rankings:\n%b' "$summary"; } > "$F" 2>/dev/null || true
+  _show_judge_report "$F"
 }
 
 # Comparative scoring: send ALL agents to the judge in one call so it ranks them
-# head-to-head and picks a winner. ★score (+🏆 winner) on each pane border + a
+# head-to-head and picks a winner. Score (+winner) on each pane border + a
 # popup with the comparison. Falls back to independent scoring if it can't parse.
 cmd_score(){
   need_tmux; goto_root
@@ -569,7 +648,7 @@ cmd_score(){
 
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   local instr req resp
-  instr="You are a rigorous, skeptical senior engineer comparing several agents that each attempted the SAME task. Compare them head-to-head on correctness, completeness, depth, and actionability. Where there is a code Diff, weigh its correctness most; for analysis/research tasks (empty diff) judge the substance and accuracy of the Output. Be calibrated and discriminating: spread the scores so the ranking is meaningful, reserve 9-10 for genuinely complete and correct work, and penalize wrong claims, vagueness, or unfinished work. Use only the evidence shown. Return STRICT JSON only, no prose: {\"rankings\":[{\"name\":\"<exact agent name>\",\"score\":N,\"reason\":\"1-2 sentences comparing it to the others\"}],\"winner\":\"<exact name>\",\"summary\":\"2-3 sentences on why the winner beat the rest\"}. Include EVERY agent in rankings, best first, name copied EXACTLY. Write all \"reason\" and \"summary\" values in the SAME LANGUAGE as the Task below; keep the JSON keys in English and copy agent names exactly as given."
+  instr="You are a rigorous, skeptical senior engineer comparing several agents that each attempted the SAME task. Compare them head-to-head on correctness, completeness, depth, and actionability. Evaluate BOTH evidence streams for every agent: the code Diff is the source of truth for implementation quality when present, while terminal Output is evidence for tests run, claims made, analysis quality, and whether the agent noticed important issues. For analysis/research tasks with empty diffs, judge the substance and accuracy of the Output and do NOT penalize an empty diff by itself. Be calibrated and discriminating: spread the scores so the ranking is meaningful, reserve 9-10 for genuinely complete and correct work, and penalize wrong claims, vagueness, or unfinished work. Do not reward or penalize Korean vs English language choice unless the task explicitly requires a language. Use only the evidence shown. Return STRICT JSON only, no prose: {\"rankings\":[{\"name\":\"<exact agent name>\",\"score\":N,\"reason\":\"one concise bullet-fragment style comparison reason\"}],\"winner\":\"<exact name>\",\"summary\":\"one concise bullet-fragment style summary of why the winner beat the rest\"}. Include EVERY agent in rankings, best first, name copied EXACTLY. Write all \"reason\" and \"summary\" values in the SAME LANGUAGE as the Task below; keep the JSON keys in English and copy agent names exactly as given."
   req=$(jq -nc --arg s "$instr" --arg t "${prompt:-(unknown task)}" --arg b "$blocks" --arg m "${COCKPIT_JUDGE_MODEL:-}" \
     '{messages:[{role:"user",content:($s + "\n\nTask: " + $t + "\n\nAGENTS (compare these):" + $b)}],max_tokens:700,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
   local raw model
@@ -580,18 +659,20 @@ cmd_score(){
   local winner; winner=$(printf '%s' "$resp" | jq -r '.winner // empty' 2>/dev/null || true)
   if ! printf '%s' "$resp" | jq -e '.rankings[0].name' >/dev/null 2>&1; then
     _score_independent "$cwin" "$prompt" "$base" "${panes[@]}"   # couldn't parse -> per-agent fallback (re-judges, reports its own model)
+    _winner_menu "$cwin"
     return 0
   fi
 
   # Write the comparative report (jq formats the whole file).
-  local F="$HOME/.config/wtcp/judge.txt"; mkdir -p "$(dirname "$F")"
+  local F; F=$(_judge_file); mkdir -p "$(dirname "$F")"
   printf '%s' "$resp" | jq -r --arg task "${prompt:-(unknown)}" --arg model "${model:-(unknown)}" '
     .winner as $w
     | "Task: \($task)\n"
       + "Judge model: \($model)\n\n"
-      + (if $w then "🏆 Winner: \($w)\n\n" else "" end)
-      + ((.summary // "") | if . != "" then . + "\n\n" else "" end)
-      + ([.rankings[] | "★ \(.score)   \(.name)\(if .name==$w then "   🏆" else "" end)\n    \(.reason)\n"] | join("\n"))
+      + (if $w then "Winner: \($w)\n\n" else "" end)
+      + ((.summary // "") | if . != "" then "Summary:\n- " + . + "\n\n" else "" end)
+      + "Rankings:\n"
+      + ([.rankings[] | "- \(.name): \(.score)/10\(if .name==$w then " (winner)" else "" end)\n  - \(.reason)"] | join("\n"))
   ' > "$F" 2>/dev/null || true
 
   # Stamp each pane border with its ★score (+🏆 winner).
@@ -611,7 +692,9 @@ cmd_score(){
     esac
   done
 
-  tmux display-popup -E -w 82% -h 60% "${PAGER:-less} '$F'" 2>/dev/null || true
+  _show_judge_report "$F" || true
+  # After reading the report, offer a one-key winner pick that merges directly.
+  _winner_menu "$cwin"
 }
 
 # Show or set the agent set compared by `wtcp start` (persists to ~/.config/wtcp/config).
@@ -665,29 +748,85 @@ cmd_prompt_send(){
   _send_to_window "$cwin" "$text"
 }
 
+cmd_show(){
+  need_tmux
+  _show_judge_report "$(_judge_file)"
+}
+
+# Interactive winner picker for the current grid (menu of scored agents -> merge).
+cmd_winner(){
+  need_tmux
+  local cwin; cwin=$(tmux display -p '#{window_id}')
+  _winner_menu "$cwin"
+}
+
+_copy_to_clipboard(){
+  local F="$1"
+  if command -v pbcopy >/dev/null 2>&1; then pbcopy < "$F"; return 0; fi
+  if command -v wl-copy >/dev/null 2>&1; then wl-copy < "$F"; return 0; fi
+  if command -v xclip >/dev/null 2>&1; then xclip -selection clipboard < "$F"; return 0; fi
+  return 1
+}
+
+cmd_copy(){
+  local F; F=$(_judge_file)
+  [ -s "$F" ] || die "no judge report yet (run 'wtcp score' first)"
+  if _copy_to_clipboard "$F"; then
+    tmux display-message "wtcp: copied last judge report" 2>/dev/null || true
+    echo "wtcp: copied last judge report"
+  else
+    cat "$F"
+    die "no clipboard command found (need pbcopy, wl-copy, or xclip)"
+  fi
+}
+
 cmd_pick(){
   need_tmux
+  # Winner is $1 when given (e.g. the winner-pick menu passes the worktree name),
+  # otherwise the focused pane's agent.
   local cwin fp winner; cwin=$(tmux display -p '#{window_id}'); fp=$(tmux display -p '#{pane_id}')
-  winner=$(pane_wt "$fp"); [ -n "$winner" ] || die "put the cursor on the winning agent pane (not the bar/empty pane)"
+  if [ -n "${1:-}" ]; then
+    winner="$1"
+  else
+    winner=$(pane_wt "$fp"); [ -n "$winner" ] || die "put the cursor on the winning agent pane (not the bar/empty pane)"
+  fi
   local losers=() p wt
   while IFS= read -r p; do
-    [ "$p" = "$fp" ] && continue
-    wt=$(pane_wt "$p"); [ -n "$wt" ] && losers+=("$wt")
+    wt=$(pane_wt "$p"); [ -z "$wt" ] && continue   # skip bar/empty panes
+    [ "$wt" = "$winner" ] && continue
+    losers+=("$wt")
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
   goto_root
   # Auto-commit the winner's uncommitted changes (workmux merge only takes commits -> else work is lost).
-  local wpath; wpath=$(_wm path "$winner" 2>/dev/null || true)
+  local wpath base has_changes=1; wpath=$(_wm path "$winner" 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
     local msg; msg=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
     echo "wtcp: auto-committing the winner's uncommitted changes..."
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" \
       || die "auto-commit failed for [$winner]; merge aborted so the worktree is preserved"
   fi
+  base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
+  if [ -n "$wpath" ] && [ -n "$base" ] && git -C "$wpath" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1; then
+    if git -C "$wpath" diff --quiet "$base" -- 2>/dev/null && [ -z "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
+      has_changes=0
+    fi
+  fi
   echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
-  _wm merge "$winner" || die "merge failed (resolve conflicts)"
+  local did_merge=0
+  if [ "$has_changes" -eq 1 ]; then
+    _wm merge "$winner" || die "merge failed (resolve conflicts)"
+    did_merge=1
+  else
+    echo "wtcp: winner has no code changes vs base; skipping workmux merge."
+    _wm remove "$winner" -f || true
+  fi
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
   tmux kill-window -t "$cwin" 2>/dev/null || true
-  echo "wtcp: done. merged winner — keep working or start another round."
+  if [ "$did_merge" -eq 1 ]; then
+    echo "wtcp: done. merged winner — keep working or start another round."
+  else
+    echo "wtcp: done. no code changes to merge — keep working or start another round."
+  fi
 }
 
 cmd_drop(){
@@ -708,7 +847,15 @@ cmd_setup(){
   local k
   for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE_CMD pick"; done
   for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE_CMD drop"; done
-  for k in R C-r; do tmux bind-key "$k" run-shell "$INVOKE_CMD score"; done
+  for k in R C-r; do
+    tmux bind-key "$k" display-menu -T "wtcp review" \
+      "Run LLM judge (score all)" r "run-shell \"$INVOKE_CMD score\"" \
+      "Pick winner to merge" p "run-shell \"$INVOKE_CMD winner\"" \
+      "Show last result" v "run-shell \"$INVOKE_CMD show\"" \
+      "Copy last result" c "run-shell \"$INVOKE_CMD copy\"" \
+      "" "" "" \
+      "Cancel" q ""
+  done
   for k in S C-s; do tmux bind-key "$k" display-popup -E "$INVOKE_CMD prompt-send"; done
   # Make the small grid panes reviewable: mouse-wheel scroll + vi paging
   # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
@@ -719,13 +866,27 @@ cmd_setup(){
     || { tmux set -g mode-mouse on 2>/dev/null; tmux set -g mouse-select-pane on 2>/dev/null; tmux set -g mouse-select-window on 2>/dev/null; } \
     || true
   tmux setw -g mode-keys vi
+  local copy_cmd=""
+  if command -v pbcopy >/dev/null 2>&1; then copy_cmd="pbcopy"
+  elif command -v wl-copy >/dev/null 2>&1; then copy_cmd="wl-copy"
+  elif command -v xclip >/dev/null 2>&1; then copy_cmd="xclip -selection clipboard"
+  fi
+  if [ -n "$copy_cmd" ]; then
+    tmux bind-key -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "$copy_cmd" 2>/dev/null || true
+    tmux bind-key -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "$copy_cmd" 2>/dev/null || true
+    tmux bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "$copy_cmd" 2>/dev/null || true
+  else
+    tmux bind-key -T copy-mode-vi y send-keys -X copy-selection-and-cancel 2>/dev/null || true
+    tmux bind-key -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel 2>/dev/null || true
+  fi
+  tmux bind-key -n WheelUpPane if-shell -F '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e; send-keys -M' 2>/dev/null || true
   # Keep lots of scrollback so `wtcp score` can feed the judge each agent's whole
   # session (set before the agent panes are created, so they inherit it).
   tmux set -g history-limit 100000
-  echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-R score (ALL agents)"
-  echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R judges EVERY agent and shows a popup."
+  echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-R review menu"
+  echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R lets you run the judge, show details, or copy the report."
   echo "  Move/resize: prefix+arrow = move (o = cycle) · prefix+z = fullscreen one (z to return) · prefix+Ctrl-arrow = resize."
-  echo "  Scroll a pane: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D (vi paging), q to exit. Diffs: workmux dashboard 'd'."
+  echo "  Scroll/copy: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D; y/Enter copies selection when a clipboard tool exists."
 }
 
 # Jump to the active grid window (overlay-like "button"). Most recent one.
@@ -766,11 +927,16 @@ cmd_doctor(){
   printf '  judge url        %s\n' "${COCKPIT_JUDGE_URL:-(unset; scoring disabled)}"
   printf '  judge model      %s\n' "${COCKPIT_JUDGE_MODEL:-(unset)}"
   printf '  agents           %s\n' "$COCKPIT_AGENTS"
-  local a p
+  local a p cmd kind
   for a in $COCKPIT_AGENTS; do
+    cmd=$(_agent_cmd "$a"); kind=$(_agent_kind "$a")
+    if [ -n "$cmd" ]; then
+      printf '    %-14s custom cmd (%s)\n' "$a" "$kind"
+      continue
+    fi
     p=$(command -v "$a" 2>/dev/null || true)
     if [ -n "$p" ]; then printf '    %-14s %s\n' "$a" "$p"
-    else printf '    %-14s not on PATH (ok if custom/defined in ~/.config/workmux/config.yaml)\n' "$a"; fi
+    else printf '    %-14s not on PATH (ok if custom/defined in ~/.config/workmux/config.yaml; kind=%s)\n' "$a" "$kind"; fi
   done
   echo
   local t miss=""
@@ -816,6 +982,9 @@ case "${1:-}" in
   abandon|a)         shift; cmd_abandon "$@";;
   grid|g)            shift; cmd_grid "$@";;
   score|r)           shift; cmd_score "$@";;
+  winner)            shift; cmd_winner "$@";;
+  show)              shift; cmd_show "$@";;
+  copy|cp)           shift; cmd_copy "$@";;
   agents)            shift; cmd_agents "$@";;
   setup)             shift; cmd_setup "$@";;
   doctor)            shift; cmd_doctor "$@";;

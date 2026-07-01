@@ -72,8 +72,10 @@ wtcp start "add a CONTRIBUTING.md"
 ```
 
 Once the grid opens, review the panes. If a judge endpoint is configured, use
-`prefix Ctrl-R` to score; then focus the winner and use `prefix Ctrl-P` to pick
-it.
+`prefix Ctrl-R` to open the review menu: run the LLM judge, show the detailed
+report, copy the last result, or **pick the winner to merge** (a menu of the
+scored agents, best first — choosing one merges it directly). You can also focus
+any pane and use `prefix Ctrl-P` to pick it yourself.
 
 ## LLM endpoint
 
@@ -117,14 +119,16 @@ The grid installs its keybindings automatically. In the grid, with your tmux
 | `Ctrl-P` | **pick** focused pane as winner → auto-commit + merge into the workmux main branch, drop the rest |
 | `Ctrl-X` | **drop** just the focused pane (grid re-tiles) |
 | `Ctrl-S` | **send** a follow-up instruction to *every* agent |
-| `Ctrl-R` | **score** every agent with the judge LLM (★ on the border + a "why" popup) |
+| `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, show the detailed report, or copy the last result |
 | `z` | fullscreen the focused agent (again to return) · arrows move between agents |
-| `[` | scroll a pane (mouse wheel also works; `Ctrl-U`/`Ctrl-D` to page, `q` to exit) |
+| `[` | scroll/copy a pane (mouse wheel also works; `Ctrl-U`/`Ctrl-D` to page, `y`/`Enter` copies, `q` exits) |
 
 Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
 Other commands: `wtcp send "..."`, `wtcp fork "..."` (new round from a pane's
-WIP), `wtcp abandon` (discard the current grid without merging), `wtcp grid`,
+WIP), `wtcp winner` (menu to pick the scored winner and merge it), `wtcp show`
+(last judge report), `wtcp copy` (copy last judge report),
+`wtcp abandon` (discard the current grid without merging), `wtcp grid`,
 `wtcp list`, `wtcp clean`, `wtcp doctor` (environment check). Run `wtcp help`
 for the full list.
 
@@ -133,7 +137,7 @@ for the full list.
 | Command | Effect |
 |---------|--------|
 | `wtcp start` | creates one worktree/branch per configured agent and opens the grid |
-| `wtcp pick` | commits the focused winner if needed, merges it, removes the other round worktrees, and closes the grid |
+| `wtcp pick` | commits the focused winner if needed, merges it when it has code changes, removes the other round worktrees, and closes the grid |
 | `wtcp drop` | removes only the focused agent's worktree/pane |
 | `wtcp fork` | commits the focused pane's WIP as a base and starts another round from it |
 | `wtcp abandon` | removes the current grid's worktrees without merging anything |
@@ -171,19 +175,42 @@ terminal window can also fail joins ("pane too small") — make the window bigge
 
 `wtcp score` sends **all agents to the configured judge LLM in one call** so
 it compares them head-to-head: it scores each 0–10 with a reason relative to the
-others and names a winner. It weighs the diff vs the round base when the task
-produced code, or the agent's terminal output when it didn't (analysis tasks).
-The popup shows the ranking, winner, and comparison; each pane border gets its
-score. It falls back to independent per-agent scoring if the comparison can't be
-parsed.
+others and names a winner. It evaluates both the diff vs the round base and the
+terminal output: the diff is the source of truth for implementation quality,
+while output is evidence for tests run, claims made, and analysis quality. Empty
+diffs are valid for analysis/review tasks and are not penalized by themselves.
+The popup shows a short bullet report; each pane border gets its score. It falls
+back to independent per-agent scoring if the comparison can't be parsed.
 
 The judge sees as much context as fits its window — the full diff plus each
 agent's whole pane scrollback, budgeted by the `*_CHARS` vars below.
 
 The report writes each agent's **reason/summary in the same language as your
 prompt** (the judge mirrors the task's language; scores, names and the structural
-labels stay as-is) and shows a `Judge model:` line naming the model the endpoint
-actually used.
+labels stay as-is), but the prompt explicitly tells the judge not to reward or
+penalize Korean vs English language choice unless your task requires a language.
+It also shows a `Judge model:` line naming the model the endpoint actually used.
+
+`wtcp copy` copies the last report from `~/.config/wtcp/judge.txt` to the system
+clipboard (`pbcopy`, `wl-copy`, or `xclip`).
+
+## Comparing Model Variants
+
+`COCKPIT_AGENTS` entries are workmux agent names and must be unique because they
+become branch/worktree suffixes. To compare the same CLI with different models or
+backends, use aliases and map each alias to a command:
+
+```sh
+COCKPIT_AGENTS="claude-sonnet claude-mlx codex-gpt5 codex-mlx"
+COCKPIT_AGENT_CLAUDE_SONNET_CMD="claude --model sonnet"
+COCKPIT_AGENT_CLAUDE_MLX_CMD="claude --model mlx"
+COCKPIT_AGENT_CODEX_GPT5_CMD="codex --model gpt-5"
+COCKPIT_AGENT_CODEX_MLX_CMD="codex --model mlx"
+```
+
+Aliases starting with `claude-`, `codex-`, or `agy-` inherit the right trust-store
+handling. For other names, set `COCKPIT_AGENT_<ALIAS>_KIND`, for example
+`COCKPIT_AGENT_MY_ALIAS_KIND="codex"`.
 
 ## Grid layout
 
@@ -205,10 +232,14 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_JUDGE_DIFF_CHARS` | `16000` | per-agent diff budget |
 | `COCKPIT_JUDGE_COMPARE_CHARS` | `48000` | total evidence budget for comparative scoring (split across agents) |
 | `COCKPIT_JUDGE_TIMEOUT` | `120` | seconds per judge request |
+| `COCKPIT_LAUNCH_TIMEOUT` | `0` | seconds to wait for agent windows; `0` auto-scales for slow cold worktree hooks |
+| `COCKPIT_POPUP_WIDTH` / `COCKPIT_POPUP_HEIGHT` | `92%` / `85%` | tmux popup size for judge details |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
 | `COCKPIT_NAMER_URL` / `COCKPIT_NAMER_MODEL` | judge settings | optional separate endpoint/model for branch naming |
 | `COCKPIT_TRUST` | `0` | **opt-in**: skip the per-agent folder-trust dialog + auto-approve tool use so new projects auto-start (edits the agents' trust stores + global workmux config) |
 | `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD` | _(see below)_ | override how claude/codex launch under `COCKPIT_TRUST` |
+| `COCKPIT_AGENT_<ALIAS>_CMD` | _(empty)_ | command used for a custom/variant agent alias |
+| `COCKPIT_AGENT_<ALIAS>_KIND` | inferred | base kind for alias trust handling (`claude`, `codex`, `agy`, etc.) |
 
 Raise the `*_CHARS` budgets for a bigger-context judge model; lower them for a
 small local one (char ≈ ⅓–¼ token, so keep the total under the model's window).

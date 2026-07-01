@@ -5,6 +5,18 @@
 # claude codex opencode gemini. Others (e.g. agy) are auto-configured by wtcp.
 COCKPIT_AGENTS="claude codex opencode"
 
+# To compare the same CLI with different models/backends, give each variant a
+# unique agent alias and map it to a command. Alias names become branch suffixes,
+# so keep them shell/git friendly: letters, numbers, dash, underscore.
+# Example:
+# COCKPIT_AGENTS="claude-sonnet claude-mlx codex-gpt5 codex-mlx"
+# COCKPIT_AGENT_CLAUDE_SONNET_CMD="claude --model sonnet"
+# COCKPIT_AGENT_CLAUDE_MLX_CMD="claude --model mlx"
+# COCKPIT_AGENT_CODEX_GPT5_CMD="codex --model gpt-5"
+# COCKPIT_AGENT_CODEX_MLX_CMD="codex --model mlx"
+# If the alias does not start with claude/codex/agy, set its kind for trust setup:
+# COCKPIT_AGENT_MY_ALIAS_KIND="codex"
+
 # LLM judge endpoint used by `wtcp score`.
 # Set this to any OpenAI-compatible /chat/completions URL you actually run.
 # Examples:
@@ -29,6 +41,14 @@ COCKPIT_JUDGE_OUTPUT_CHARS=16000
 COCKPIT_JUDGE_DIFF_CHARS=16000
 COCKPIT_JUDGE_COMPARE_CHARS=48000
 COCKPIT_JUDGE_TIMEOUT=120
+
+# Launch polling. 0 = auto, currently generous enough for cold project hooks
+# such as per-worktree pnpm install. Set a larger number for very slow hooks.
+COCKPIT_LAUNCH_TIMEOUT=0
+
+# Judge/detail popup size inside tmux.
+COCKPIT_POPUP_WIDTH="92%"
+COCKPIT_POPUP_HEIGHT="85%"
 
 # Branch-name generator from the prompt: fm (Apple Intelligence, macOS, on-device)
 # | mlx (OpenAI-compatible endpoint) | off (ASCII slug of the prompt).

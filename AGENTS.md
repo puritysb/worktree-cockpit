@@ -33,6 +33,17 @@ This file is the design/gotcha memory for working ON wtcp itself.
   via `$INVOKE <verb>` (INVOKE resolves to `wtcp` on PATH).
 - `cmd_score` does **comparative** judging (all agents in one LLM call → rank +
   winner), falling back to independent per-agent scoring (`_score_independent`).
+- `prefix Ctrl-R` opens a `display-menu` (run judge / pick-winner / show / copy).
+  After scoring — and via `wtcp winner` / the menu's "pick winner" — `_winner_menu`
+  reads the ★scores stamped on each pane border, ranks best-first, and a selection
+  runs `wtcp pick <worktree>`. `cmd_pick` therefore takes an OPTIONAL worktree arg
+  (the menu passes it); with no arg it uses the focused pane. Losers are found by
+  worktree name, not pane focus, so an explicit winner still drops the rest.
+  `_winner_menu`/`display-menu` no-op without an attached client (headless tests).
+- `cmd_pick` skips `workmux merge` when the winner has NO changes vs `@cockpit_base`
+  (analysis/research round) and just cleans up — `workmux merge` errors on an
+  empty branch. `_show_judge_report` opens the report popup WITHOUT less's `-F`
+  (which would auto-quit and flash the popup shut when the report fits one screen).
 
 ## Hard-won gotchas (do not regress these)
 
@@ -42,9 +53,11 @@ This file is the design/gotcha memory for working ON wtcp itself.
 2. **join-pane stacks vertically → "create pane failed: pane too small".** The 5th/6th
    agent fails to join unless the grid is re-tiled after each join. `_run_round` runs
    `select-layout tiled` after every join-pane during assembly.
-3. **workmux creates worktrees sequentially (~1.5–2s each).** A fixed `sleep` races
-   past >4 agents. `_run_round` polls until all agent windows appear (timeout scales
-   with agent count).
+3. **workmux creates worktrees sequentially and project hooks can be slow.** A fixed
+   `sleep` races past >4 agents and cold hooks (for example per-worktree `pnpm
+   install`) can take much longer. `_run_round` ignores a non-zero `workmux add`
+   exit and polls until all agent windows appear; `COCKPIT_LAUNCH_TIMEOUT=0`
+   auto-scales generously by agent count, or can be set to seconds explicitly.
 4. **tmux assigns panes to layout cells by pane-INDEX order, NOT by the pane ids in
    the layout string** (verified). The grid is built rows-first so index order →
    row-major fill; the blank pad pane is created last so it lands in the final cell.
@@ -69,7 +82,10 @@ This file is the design/gotcha memory for working ON wtcp itself.
 8. **`wtcp clean` must remove worktrees BEFORE killing windows** — it is usually run
    from the grid's bottom bar pane, and killing that window would otherwise end the
    script before removal (the old "run clean twice" bug). Kills its own window last.
-9. **Mouse/keys are tmux SERVER-GLOBAL and the terminal's mouse-reporting state can
+9. **workmux window names may have a `wm-` prefix.** `_find_task_windows` must match
+   both `<task>-<agent>` and `wm-<task>-<agent>`; exact-only matching fails grid
+   assembly even though the worktrees launched.
+10. **Mouse/keys are tmux SERVER-GLOBAL and the terminal's mouse-reporting state can
    go stale.** `cmd_setup` sets `mouse on` + keybindings globally, but they don't fix
    the layers above tmux. Symptom seen in the wild: identical config works on one
    machine, not another — click-to-select-pane + wheel scroll dead even with
@@ -84,14 +100,16 @@ This file is the design/gotcha memory for working ON wtcp itself.
 
 ## Config vars (all `COCKPIT_*`, set in `~/.config/wtcp/config`)
 
-Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
-`COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`, `COCKPIT_AGY_DELAY`.
+Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD`,
+`COCKPIT_AGENT_<ALIAS>_KIND`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
+`COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`,
+`COCKPIT_AGY_DELAY`, `COCKPIT_LAUNCH_TIMEOUT`.
 Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_MODEL`,
 `COCKPIT_NAMER_AUTH`, `COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
 Judge: `COCKPIT_JUDGE_URL`, `COCKPIT_JUDGE_AUTH` (Authorization header for hosted
 endpoints; namer reuses it by default via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_MODEL`,
 `COCKPIT_JUDGE_OUTPUT_CHARS`, `COCKPIT_JUDGE_DIFF_CHARS`, `COCKPIT_JUDGE_COMPARE_CHARS`,
-`COCKPIT_JUDGE_TIMEOUT`.
+`COCKPIT_JUDGE_TIMEOUT`, `COCKPIT_POPUP_WIDTH`, `COCKPIT_POPUP_HEIGHT`.
 Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path).
 
 ## Testing wtcp without real agents
