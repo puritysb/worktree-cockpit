@@ -14,7 +14,7 @@ workmux main branch.
 │ claude  ★ 8  │ codex   ★ 9  │ opencode ★ 6 │   ← one prompt, N agents, scored
 │              │              │              │
 ├──────────────┴──────────────┴──────────────┤
-│ wtcp (prefix, then) Ctrl-P pick · Ctrl-X drop · Ctrl-S send-all · Ctrl-R score
+│ wtcp (prefix, then) Ctrl-P pick · Ctrl-X drop · Ctrl-S send-all · Ctrl-R review
 └─────────────────────────────────────────────┘
 ```
 
@@ -121,7 +121,7 @@ The grid installs its keybindings automatically. In the grid, with your tmux
 | `Ctrl-S` | **send** a follow-up instruction to *every* agent |
 | `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, show the detailed report, or copy the last result |
 | `z` | fullscreen the focused agent (again to return) · arrows move between agents |
-| `[` | scroll/copy a pane (mouse wheel also works; `Ctrl-U`/`Ctrl-D` to page, `y`/`Enter` copies, `q` exits) |
+| `[` | scroll/copy a pane (mouse wheel scrolls; drag to select copies to the clipboard; `Ctrl-U`/`Ctrl-D` page, `y`/`Enter` copy, `q` exits) |
 
 Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
