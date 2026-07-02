@@ -133,6 +133,16 @@ Clicking any pane (focused or not) selects it; the mouse wheel scrolls the pane
 **under the cursor** — agents that handle the mouse themselves get the wheel
 events directly, other panes scroll tmux history.
 
+Each agent pane's border also shows a **live status**: `⚡` while the agent is
+producing output, `💬` once it has been quiet for a few seconds (waiting for
+input or done). workmux's own window-name status icons can't survive the grid
+(the agent windows are joined into it), so wtcp tracks this itself — tune or
+disable with `COCKPIT_STATUS*` (see [Configuration](#configuration)).
+
+`wtcp pick` and `wtcp merge` also pass workmux merge strategies through:
+`wtcp pick <name> --squash`, `--rebase`, or `--into <branch>` (stacked
+branches) work exactly like `workmux merge`'s flags.
+
 Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
 Other commands: `wtcp send "..."`, `wtcp merge` (merge the **judge's winner**
@@ -334,6 +344,8 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_JUDGE_COMPARE_CHARS` | `48000` | total evidence budget for comparative scoring (split across agents) |
 | `COCKPIT_JUDGE_TIMEOUT` | `120` | seconds per judge request |
 | `COCKPIT_LAUNCH_TIMEOUT` | `0` | seconds to wait for agent windows; `0` auto-scales for slow cold worktree hooks |
+| `COCKPIT_STATUS` | `1` | live ⚡/💬 status on grid pane borders (`0` disables) |
+| `COCKPIT_STATUS_INTERVAL` / `COCKPIT_STATUS_IDLE` | `3` / `6` | status poll interval / seconds of quiet before 💬 |
 | `COCKPIT_POPUP_WIDTH` / `COCKPIT_POPUP_HEIGHT` | `92%` / `85%` | tmux popup size for judge details |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
 | `COCKPIT_NAMER_URL` / `COCKPIT_NAMER_MODEL` | judge settings | optional separate endpoint/model for branch naming |

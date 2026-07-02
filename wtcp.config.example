@@ -64,6 +64,12 @@ COCKPIT_JUDGE_TIMEOUT=120
 # such as per-worktree pnpm install. Set a larger number for very slow hooks.
 COCKPIT_LAUNCH_TIMEOUT=0
 
+# Live agent status on the grid pane borders: ⚡ output changing (working),
+# 💬 quiet (waiting for input / done). 0 disables the background watcher.
+# COCKPIT_STATUS=1
+# COCKPIT_STATUS_INTERVAL=3
+# COCKPIT_STATUS_IDLE=6
+
 # Judge/detail popup size inside tmux.
 COCKPIT_POPUP_WIDTH="92%"
 COCKPIT_POPUP_HEIGHT="85%"

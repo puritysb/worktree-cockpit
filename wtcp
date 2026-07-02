@@ -10,8 +10,9 @@
 #   wtcp merge                          m       prefix Ctrl-R merge the JUDGE'S winner (scored 🏆/top-★) -> pick machinery, no menu
 #   wtcp winner                                 prefix Ctrl-R menu: pick the winning agent (best score first) -> merge it
 #   wtcp diff [name]                            prefix Ctrl-R view an agent's FULL diff vs the round base (focused pane, or menu)
-#   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
-#                                                             (a winner with NO code changes is KEPT as a live session instead of merged)
+#   wtcp pick [name] [merge flags]      p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
+#                                                             (a winner with NO code changes is KEPT as a live session instead of merged;
+#                                                              pick/merge pass --squash/--rebase/--into <branch> through to workmux merge)
 #   wtcp keep [name]                    k       prefix Ctrl-K keep ONE agent's live session (own window, no merge), drop the rest + grid
 #   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
 #   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
@@ -47,6 +48,12 @@ WTCP_CONFIG="${WTCP_CONFIG:-$HOME/.config/wtcp/config}"
 : "${COCKPIT_SEND_DELAY:=0.4}"        # delay between paste and Enter (avoids codex submit race)
 : "${COCKPIT_AGY_DELAY:=4}"           # wait before send-keys-delivering to a non-builtin agent
 : "${COCKPIT_LAUNCH_TIMEOUT:=0}"      # seconds to wait for workmux windows; 0 = auto by agent count
+# Live status on the grid pane borders (workmux's window-name icons are lost
+# when the agent windows are joined into the grid, so wtcp tracks its own):
+# ⚡ = output changed recently (agent working) · 💬 = quiet (waiting/done).
+: "${COCKPIT_STATUS:=1}"              # 0 disables the watcher
+: "${COCKPIT_STATUS_INTERVAL:=3}"     # seconds between polls
+: "${COCKPIT_STATUS_IDLE:=6}"         # quiet for this long -> 💬
 # OPT-IN: 1 = launch agents with their folder-trust/permission/sandbox bypass
 # flags so a brand-new project auto-starts. This disarms approval/sandbox gates
 # (the agents auto-approve all tool use) and edits the global workmux config, so
@@ -406,10 +413,55 @@ _launch_timeout_bail(){   # $1=task $2=found windows ("<win> <worktree>" lines) 
 _style_window(){   # $1=window id
   local w="$1"
   tmux set-window-option -t "$w" pane-border-status top 2>/dev/null || true
-  tmux set-window-option -t "$w" pane-border-format ' #{?#{@cockpit_bar},#[fg=colour45]#[bold],#[bold]}#{@pane_label} #[default]' 2>/dev/null || true
+  tmux set-window-option -t "$w" pane-border-format ' #{?#{@cockpit_bar},#[fg=colour45]#[bold],#[bold]}#{@pane_label}#{?#{@cockpit_status}, #{@cockpit_status},} #[default]' 2>/dev/null || true
   tmux set-window-option -t "$w" pane-border-lines heavy 2>/dev/null || true
   tmux set-window-option -t "$w" pane-border-style 'fg=colour240' 2>/dev/null || true
   tmux set-window-option -t "$w" pane-active-border-style 'fg=colour45' 2>/dev/null || true
+}
+
+# Live per-pane agent status for a grid/kept window. Joining the agent windows
+# into the grid destroys workmux's own window-name status icons, so wtcp polls
+# each agent pane's recent output: changed since last poll -> ⚡ (working),
+# quiet for COCKPIT_STATUS_IDLE seconds -> 💬 (waiting for input / done). The
+# icon is stored in the pane's @cockpit_status and rendered by _style_window's
+# border format. One watcher per window (pid in @cockpit_watch); it exits by
+# itself when the window disappears (pick/keep/abandon/clean).
+cmd_status_watch(){
+  local w="${1:-}"; [ -n "$w" ] || die 'status-watch <window-id>'
+  local existing; existing=$(tmux show-options -wqv -t "$w" @cockpit_watch 2>/dev/null || true)
+  if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then return 0; fi
+  tmux set-option -w -t "$w" @cockpit_watch "$$" 2>/dev/null || return 0
+  local p wt h prev seen now st
+  while tmux list-panes -t "$w" >/dev/null 2>&1; do
+    now=$(date +%s)
+    while IFS= read -r p; do
+      wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
+      # Hash the WHOLE visible pane: capture-pane pads the viewport with
+      # trailing blank lines, so a `tail -n` sample would hash constant blanks
+      # while the real content changes further up.
+      h=$(tmux capture-pane -p -t "$p" 2>/dev/null | cksum 2>/dev/null || true)
+      prev=$(tmux show-options -pqv -t "$p" @cockpit_hash 2>/dev/null || true)
+      if [ "$h" != "$prev" ]; then
+        tmux set-option -p -t "$p" @cockpit_hash "$h" 2>/dev/null || true
+        tmux set-option -p -t "$p" @cockpit_seen "$now" 2>/dev/null || true
+        st="⚡"
+      else
+        seen=$(tmux show-options -pqv -t "$p" @cockpit_seen 2>/dev/null || true)
+        [ -n "$seen" ] || seen=$now
+        if [ $(( now - seen )) -ge "$COCKPIT_STATUS_IDLE" ]; then st="💬"; else st="⚡"; fi
+      fi
+      [ "$(tmux show-options -pqv -t "$p" @cockpit_status 2>/dev/null || true)" = "$st" ] \
+        || tmux set-option -p -t "$p" @cockpit_status "$st" 2>/dev/null || true
+    done < <(tmux list-panes -t "$w" -F '#{pane_id}' 2>/dev/null || true)
+    sleep "$COCKPIT_STATUS_INTERVAL"
+  done
+}
+# Detached spawn: the spawner often dies moments later (keep/pick kill the
+# very pane that ran them), and tmux HUPs the pane's whole process group — so
+# double-fork AND nohup, or the watcher dies with its parent.
+_spawn_status_watch(){   # $1=window id
+  [ "${COCKPIT_STATUS:-1}" = 1 ] || return 0
+  ( nohup env WTCP_CONFIG="$WTCP_CONFIG" "$SELF" status-watch "$1" >/dev/null 2>&1 & ) 2>/dev/null || true
 }
 
 # Banner printed at the top of the command-bar pane (it runs in the pane's tty,
@@ -511,6 +563,7 @@ _run_round(){
   done
   tmux select-pane -t "$bar"
   tmux select-window -t "$cwin"
+  _spawn_status_watch "$cwin"
   ok "grid ready."
 }
 
@@ -609,13 +662,13 @@ cmd_abandon(){
   while IFS= read -r p; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] && (_wm remove "$wt" -f || true)
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
-  # Only kill a wtcp-owned (wt:*) window — abandoning from a plain shell
-  # window must not destroy that window.
+  ok "grid abandoned (nothing merged)."
+  # LAST on purpose (see _keep_session). Only kill a wtcp-owned (wt:*) window —
+  # abandoning from a plain shell window must not destroy that window.
   case "$(tmux display -p -t "$cwin" '#{window_name}' 2>/dev/null)" in
     "${WIN_PREFIX}:"*) tmux kill-window -t "$cwin" 2>/dev/null || true ;;
     *) say "(not inside a wtcp grid window — nothing to close)" ;;
   esac
-  ok "grid abandoned (nothing merged)."
 }
 
 # ===== Built-in judge =====
@@ -976,7 +1029,7 @@ cmd_merge(){
     die "no scored winner in this grid — run 'wtcp score' first, or 'wtcp pick <name>' to choose manually"
   fi
   say "merging the judge's winner [$winner]"
-  cmd_pick "$winner"
+  cmd_pick "$winner" "$@"   # merge strategy flags (--squash/--rebase/--into) pass through
 }
 
 # Full-diff viewer. Worktree from $1 when given (the diff menu passes it),
@@ -1080,12 +1133,16 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   _style_window "$nwin"
   local l
   for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
-  [ "$nwin" = "$cwin" ] || tmux kill-window -t "$cwin" 2>/dev/null || true
   tmux select-window -t "$nwin" 2>/dev/null || true
+  _spawn_status_watch "$nwin"
   tmux display-message "wtcp: kept [$keep] — talk to it directly; prefix Ctrl-F forks a new round from it" 2>/dev/null || true
   ok "kept [$keep] (worktree + live session, nothing merged). dropped: ${*:-(none)}"
   say "continue in its pane. prefix Ctrl-F (or 'wtcp fork \"<prompt>\"') fans out a new"
   echo "     multi-agent round from this agent's work; 'wtcp drop' discards it when done."
+  # LAST on purpose: keep/pick usually run inside the grid's own bar pane, and
+  # killing the grid kills that pane — and this very process with it. Nothing
+  # after this line is guaranteed to execute.
+  [ "$nwin" = "$cwin" ] || tmux kill-window -t "$cwin" 2>/dev/null || true
 }
 
 cmd_keep_menu(){ need_tmux; _keep_menu "$(_cur_win)"; }
@@ -1113,12 +1170,20 @@ cmd_keep(){
 
 cmd_pick(){
   need_tmux
-  # Winner is $1 when given (e.g. the winner-pick menu passes the worktree name),
-  # otherwise the focused pane's agent.
-  local cwin fp winner; cwin=$(_cur_win); fp=$(_cur_pane)
-  if [ -n "${1:-}" ]; then
-    winner="$1"
-  else
+  # Winner = first non-flag arg (the winner menu / `wtcp merge` pass it), else
+  # the focused pane's agent. workmux merge STRATEGY flags pass through:
+  # --squash, --rebase, --into <branch> (see `workmux merge --help`).
+  local winner="" mergeargs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --squash|--rebase) mergeargs+=("$1"); shift ;;
+      --into) [ -n "${2:-}" ] || die "pick: --into needs a branch name"; mergeargs+=("$1" "$2"); shift 2 ;;
+      --*) die "pick: unknown option $1 (merge flags: --squash --rebase --into <branch>)" ;;
+      *) winner="$1"; shift ;;
+    esac
+  done
+  local cwin fp; cwin=$(_cur_win); fp=$(_cur_pane)
+  if [ -z "$winner" ]; then
     winner=$(pane_wt "$fp"); [ -n "$winner" ] || die "put the cursor on the winning agent pane (not the bar/empty pane)"
   fi
   local losers=() p wt
@@ -1150,15 +1215,16 @@ cmd_pick(){
     _keep_session "$cwin" "$winner" "${losers[@]:-}"
     return 0
   fi
-  say "winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
-  _wm merge "$winner" || { _merge_fail_recover "$winner"; exit 1; }
+  say "winner [$winner] -> merge${mergeargs[0]:+ (${mergeargs[*]})} to workmux main branch / cleanup: ${losers[*]:-(none)}"
+  _wm merge "$winner" ${mergeargs[@]+"${mergeargs[@]}"} || { _merge_fail_recover "$winner"; exit 1; }
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
-  # Close the grid/kept window — but only a wtcp-owned (wt:*) window. `wtcp
-  # pick <name>` can be run from any shell window; that window must survive.
+  ok "done. merged winner — keep working or start another round."
+  # LAST on purpose (see _keep_session): closing the grid can kill this very
+  # process when pick was typed in the bar pane. Only wtcp-owned (wt:*) windows
+  # are closed — `wtcp pick <name>` from a plain shell window must not kill it.
   case "$(tmux display -p -t "$cwin" '#{window_name}' 2>/dev/null)" in
     "${WIN_PREFIX}:"*) tmux kill-window -t "$cwin" 2>/dev/null || true ;;
   esac
-  ok "done. merged winner — keep working or start another round."
 }
 
 cmd_drop(){
@@ -1321,6 +1387,7 @@ ${B}START A ROUND${O}                                                      ${D}a
 ${B}REVIEW & FINISH${O}
   wtcp score            LLM judge ranks all agents + names a winner       ${D}r      prefix Ctrl-R${O}
   wtcp merge            merge the judge's winner ${D}(one shot, no menu)${O}      ${D}m      prefix Ctrl-R${O}
+                        ${D}pick/merge take workmux flags: --squash · --rebase · --into <branch>${O}
   wtcp winner           menu of scored agents -> merge the choice         ${D}       prefix Ctrl-R${O}
   wtcp pick             merge the FOCUSED agent, drop the rest            ${D}p      prefix Ctrl-P${O}
                         ${D}winner has no code changes? -> keeps the session${O}
@@ -1393,6 +1460,7 @@ case "${1:-}" in
   agents)            shift; cmd_agents "$@";;
   setup)             shift; cmd_setup "$@";;
   bar-banner)        shift; cmd_bar_banner "$@";;
+  status-watch)      shift; cmd_status_watch "$@";;
   doctor)            shift; cmd_doctor "$@";;
   list|ls)           shift; cmd_list "$@";;
   clean|clear)       shift; cmd_clean "$@";;

@@ -37,6 +37,15 @@ This file is the design/gotcha memory for working ON wtcp itself.
   🏆-marked pane label (comparative scoring), else the top numeric ★ from
   `_scored_rows`, and hands the name to `cmd_pick` (so the diff/no-diff split
   applies). Refuses when nothing is scored. The menus stay for manual choice.
+  `cmd_pick`/`cmd_merge` pass workmux merge STRATEGY flags through verbatim
+  (`--squash`, `--rebase`, `--into <branch>`); winner = first non-flag arg.
+- Live pane status: `_spawn_status_watch` (from `_run_round`/`_keep_session`)
+  runs one detached `cmd_status_watch` per grid/kept window (pid in
+  `@cockpit_watch`, single-instance, exits when the window dies). It hashes
+  each agent pane's WHOLE visible content per COCKPIT_STATUS_INTERVAL and
+  stamps `@cockpit_status` ⚡ (changing) / 💬 (quiet ≥ COCKPIT_STATUS_IDLE s),
+  rendered by `_style_window`'s border format. Needed because join-pane
+  destroys workmux's own window-name status icons. See gotchas 12–14.
 - `prefix Ctrl-R` opens a `display-menu` (run judge / merge-winner / pick-winner
   menu / keep / view-diff / show / copy). After scoring — and via `wtcp winner` /
   the menu's "pick winner" —
@@ -153,7 +162,25 @@ This file is the design/gotcha memory for working ON wtcp itself.
    attached — keybindings' run-shell and popups don't set TMUX_PANE but always
    have a client). Window-scoped `@cockpit_*` reads must pass `-t "$cwin"` /
    `-t "$(_cur_win)"` for the same reason.
-12. **`break-pane` on a single-pane window "succeeds" but only renames (tmux ≥ 3.4).**
+12. **Commands that close the window they run in must do the `kill-window` LAST.**
+   keep/pick/abandon usually execute inside the grid's bar pane; killing the
+   grid HUPs that pane's process group — including the running wtcp and
+   anything it just spawned. Everything after the kill is NOT guaranteed to
+   run (`_keep_session` once spawned the kept-window status watcher after the
+   kill: it never started). Corollary: background helpers are spawned with
+   `nohup` + double fork (`_spawn_status_watch`) so they survive the HUP.
+   (Same family as gotcha 8 / cmd_clean's remove-before-kill ordering.)
+13. **`capture-pane -p` pads the viewport with trailing blank lines.** Sampling
+   "the last N lines" therefore hashes constant blanks while the real content
+   changes further up — the status watcher must hash the WHOLE captured pane
+   (`cmd_status_watch`), not a `tail -n` of it.
+14. **tmux mangles non-ASCII option values to `_` ON READ when the reading
+   client's locale is not UTF-8** (storage keeps the raw bytes; verified by
+   matrix test). All ★/🏆/⚡ parsing (`_scored_rows`, `_scored_winner`, status
+   icons) assumes UTF-8 readers — true for normal shells, but headless tests
+   MUST run every tmux client with `LC_ALL=C.utf8` or scored labels read back
+   as `___` and winner resolution silently fails.
+15. **`break-pane` on a single-pane window "succeeds" but only renames (tmux ≥ 3.4).**
    rc=0, EMPTY `-P` output, no new window. `_keep_session` must detect the
    1-pane case (keep/pick re-run inside an already-kept window) and rename in
    place instead — otherwise `nwin` is empty and the later `kill-window` on the
@@ -181,7 +208,8 @@ Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD` (full command, wins
 `COCKPIT_AGENT_<ALIAS>_MODEL` (kind CLI + `--model`; see `_agent_launch_cmd`),
 `COCKPIT_AGENT_<ALIAS>_KIND`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
 `COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`,
-`COCKPIT_AGY_DELAY`, `COCKPIT_LAUNCH_TIMEOUT`.
+`COCKPIT_AGY_DELAY`, `COCKPIT_LAUNCH_TIMEOUT`, `COCKPIT_STATUS`,
+`COCKPIT_STATUS_INTERVAL`, `COCKPIT_STATUS_IDLE`.
 Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_MODEL`,
 `COCKPIT_NAMER_AUTH`, `COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
 Judge: `COCKPIT_JUDGE_URL`, `COCKPIT_JUDGE_AUTH` (Authorization header for hosted
