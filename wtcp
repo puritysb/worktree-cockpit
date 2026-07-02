@@ -7,6 +7,7 @@
 #   wtcp score                          r       prefix Ctrl-R compare all agents with an LLM: rank + winner (scores on borders + popup)
 #   wtcp show                                                 show the last judge report popup
 #   wtcp copy                           cp                    copy the last judge report to the clipboard
+#   wtcp merge                          m       prefix Ctrl-R merge the JUDGE'S winner (scored 🏆/top-★) -> pick machinery, no menu
 #   wtcp winner                                 prefix Ctrl-R menu: pick the winning agent (best score first) -> merge it
 #   wtcp diff [name]                            prefix Ctrl-R view an agent's FULL diff vs the round base (focused pane, or menu)
 #   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
@@ -55,13 +56,23 @@ WIN_PREFIX="wt"
 BAR_HEIGHT=6
 # Always-visible shortcut cheatsheet (shown on the command-bar pane border).
 # Use Ctrl + the letter; the Ctrl variant passes through the Korean IME.
-BAR_KEYS='wtcp (prefix, then)   Ctrl-P pick(merge) · Ctrl-K keep(no merge) · Ctrl-X drop · Ctrl-S send-all · Ctrl-F fork · Ctrl-R review menu    |    z = fullscreen one · arrows = move · [ = scroll'
+BAR_KEYS='wtcp ▸ command bar   —   prefix + Ctrl-P pick·merge / Ctrl-K keep / Ctrl-X drop / Ctrl-S send-all / Ctrl-F fork / Ctrl-R review menu   —   z fullscreen · [ scroll'
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # Path the keybindings call back through. Prefer `wtcp` on PATH; fall back to this
 # script's absolute path. COCKPIT_INVOKE overrides (e.g. a wrapper command).
 INVOKE="${COCKPIT_INVOKE:-$(command -v wtcp || echo "$SELF")}"
 
-die(){ echo "wtcp: $*" >&2; exit 1; }
+# Terminal styling for wtcp's own output. Colors only when the stream is a
+# tty (pane/terminal) and NO_COLOR is unset — piped/captured output stays plain.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_TAG=$'\033[1;36m'; C_OK=$'\033[1;32m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_TAG=""; C_OK=""; C_DIM=""; C_BOLD=""; C_OFF=""
+fi
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then E_RED=$'\033[1;31m'; E_OFF=$'\033[0m'; else E_RED=""; E_OFF=""; fi
+say(){ printf '%s %s\n' "${C_TAG}wtcp${C_OFF}" "$*"; }            # progress line
+ok(){  printf '%s %s\n' "${C_OK}wtcp ✔${C_OFF}" "$*"; }           # completed action
+die(){ printf '%s %s\n' "${E_RED}wtcp ✗${E_OFF}" "$*" >&2; exit 1; }
 _sh_quote(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 if [ -n "${COCKPIT_INVOKE:-}" ]; then
   # COCKPIT_INVOKE is a shell command prefix, not necessarily a single path:
@@ -388,6 +399,29 @@ _launch_timeout_bail(){   # $1=task $2=found windows ("<win> <worktree>" lines) 
   die "round '$task' did not fully launch"
 }
 
+# Window chrome for grid/kept windows: heavy dim pane borders with a bright
+# active border, labels on top. This is what makes the separators visible —
+# including the line between the agent grid and the bottom command bar (the
+# bar's label is highlighted so the bar doesn't read as just another log pane).
+_style_window(){   # $1=window id
+  local w="$1"
+  tmux set-window-option -t "$w" pane-border-status top 2>/dev/null || true
+  tmux set-window-option -t "$w" pane-border-format ' #{?#{@cockpit_bar},#[fg=colour45]#[bold],#[bold]}#{@pane_label} #[default]' 2>/dev/null || true
+  tmux set-window-option -t "$w" pane-border-lines heavy 2>/dev/null || true
+  tmux set-window-option -t "$w" pane-border-style 'fg=colour240' 2>/dev/null || true
+  tmux set-window-option -t "$w" pane-active-border-style 'fg=colour45' 2>/dev/null || true
+}
+
+# Banner printed at the top of the command-bar pane (it runs in the pane's tty,
+# so colors are always on). Distinguishes the bar from agent output at a glance.
+cmd_bar_banner(){
+  local T=$'\033[1;36m' D=$'\033[2m' B=$'\033[1m' O=$'\033[0m'
+  printf '%s\n' \
+    "${T}◤ wtcp command bar${O}${D} — a normal shell: type wtcp commands here (their logs show here too)${O}" \
+    "  ${B}keys${O}  prefix + ${B}Ctrl-P${O} pick·merge ${D}│${O} ${B}Ctrl-K${O} keep ${D}│${O} ${B}Ctrl-X${O} drop ${D}│${O} ${B}Ctrl-S${O} send-all ${D}│${O} ${B}Ctrl-F${O} fork ${D}│${O} ${B}Ctrl-R${O} review menu" \
+    "  ${B}cli ${O}  wtcp score ${D}│${O} merge ${D}│${O} keep ${D}│${O} send \"...\" ${D}│${O} fork \"...\" ${D}│${O} diff ${D}│${O} abandon ${D}│${O} help"
+}
+
 # One round: branch N agents from base + broadcast prompt + assemble grid.
 _run_round(){
   local prompt="$1" task="$2" base="${3:-}"
@@ -400,9 +434,9 @@ _run_round(){
 
   local nag neww found_count add_status=0 timeout_s deadline now
   nag=0; for a in $COCKPIT_AGENTS; do nag=$((nag+1)); done
-  echo "wtcp: '$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
+  say "'$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
   _wm add "$task" "${addargs[@]}" -p "$prompt" -b >/dev/null || add_status=$?
-  [ "$add_status" -eq 0 ] || echo "wtcp: workmux add returned $add_status; waiting for launched windows..."
+  [ "$add_status" -eq 0 ] || say "workmux add returned $add_status; waiting for launched windows..."
   # workmux creates each worktree sequentially and project hooks can make cold
   # worktrees slow, so poll until all agent windows appear. Some successful
   # launches still return non-zero (for example CLI notifier hooks); the window
@@ -462,12 +496,11 @@ _run_round(){
   # Full-width bottom command bar (grid compresses above it; it survives drops).
   local bar
   bar=$(tmux split-window -d -f -v -l "$BAR_HEIGHT" -t "$cwin" -P -F '#{pane_id}' \
-        "printf '%s\n' '-- wtcp -- shortcut keys are on the pane borders above. Follow-up to all: wtcp send \"...\"'; exec \${SHELL:-/bin/zsh}")
+        "$INVOKE_CMD bar-banner; exec \${SHELL:-/bin/zsh}")
   tmux set-option -p -t "$bar" @cockpit_bar 1
   # Always-visible cheatsheet: pane-border line shows the keys on the bar and the
   # worktree name on each agent pane (score later augments these with ★ scores).
-  tmux set-window-option -t "$cwin" pane-border-status top
-  tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
+  _style_window "$cwin"
   tmux set-option -p -t "$bar" @pane_label "$BAR_KEYS"
   # Non-builtin agents (agy, etc.) aren't prompt-injected by workmux -p -> deliver via send-keys.
   local sa p wt
@@ -478,7 +511,7 @@ _run_round(){
   done
   tmux select-pane -t "$bar"
   tmux select-window -t "$cwin"
-  echo "wtcp: grid ready."
+  ok "grid ready."
 }
 
 # True if any `<task>-<agent>` branch already exists (collision).
@@ -558,12 +591,12 @@ cmd_fork(){
   goto_root
   local wpath; wpath=$(_wm path "$wt" 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
-    echo "wtcp: committing [$wt] WIP (pinning the fork base)..."
+    say "committing [$wt] WIP (pinning the fork base)..."
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "wip: fork base from $wt" || true
   fi
   local task; task=$(slugify "$prompt"); [ -n "$task" ] || task="t$(date +%H%M%S)"
   _resolve_task "$task"; task="$RESOLVED_TASK"
-  echo "wtcp: forking from [$wt] -> new round"
+  say "forking from [$wt] -> new round"
   _run_round "$prompt" "$task" "$wt"
 }
 
@@ -580,9 +613,9 @@ cmd_abandon(){
   # window must not destroy that window.
   case "$(tmux display -p -t "$cwin" '#{window_name}' 2>/dev/null)" in
     "${WIN_PREFIX}:"*) tmux kill-window -t "$cwin" 2>/dev/null || true ;;
-    *) echo "wtcp: (not inside a wtcp grid window — nothing to close)" ;;
+    *) say "(not inside a wtcp grid window — nothing to close)" ;;
   esac
-  echo "wtcp: grid abandoned (nothing merged)."
+  ok "grid abandoned (nothing merged)."
 }
 
 # ===== Built-in judge =====
@@ -674,7 +707,7 @@ _show_diff_popup(){   # $1=worktree name
   body=$(_wt_diff_raw "$path" "$base" "$color")
   if [ -z "$body" ]; then
     tmux display-message "wtcp: [$wt] has no changes vs ${base:-main}" 2>/dev/null || true
-    echo "wtcp: [$wt] has no changes vs ${base:-main}"
+    say "[$wt] has no changes vs ${base:-main}"
     return 0
   fi
   F=$(_diff_file); mkdir -p "$(dirname "$F")"
@@ -729,6 +762,23 @@ _agent_menu(){   # $1=grid window $2=menu title $3=verb (pick|diff)
 _winner_menu(){ _agent_menu "$1" "wtcp — pick winner to merge" pick; }
 _diff_menu(){   _agent_menu "$1" "wtcp — view agent diff" diff; }
 _keep_menu(){   _agent_menu "$1" "wtcp — keep agent session (no merge)" keep; }
+# The judge's winner, read from the scored pane borders: the 🏆-marked pane
+# (comparative scoring), else the highest numeric ★ score (independent-scoring
+# fallback stamps no trophy). Empty when nothing has been scored.
+_scored_winner(){   # $1=grid window -> worktree name or ""
+  local cwin="$1" p wt label
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
+    label=$(tmux show-options -pqv -t "$p" @pane_label 2>/dev/null || true)
+    case "$label" in *🏆*) printf '%s' "$wt"; return 0;; esac
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  local s n
+  while IFS=$'\t' read -r s n; do
+    [ "$s" = "?" ] && continue
+    printf '%s' "$n"; return 0
+  done < <(_scored_rows "$cwin")
+  return 0
+}
 
 # Fallback: judge each agent independently (used if comparative parsing fails).
 _score_independent(){
@@ -760,8 +810,7 @@ cmd_score(){
   local cwin prompt base; cwin=$(_cur_win)
   prompt=$(tmux show-options -wqv -t "$cwin" @cockpit_prompt 2>/dev/null || true)
   base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
-  tmux set-window-option -t "$cwin" pane-border-status top
-  tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
+  _style_window "$cwin"
   # Collect agent panes (skip the bar/empty panes).
   local p wt names=() panes=() nag=0
   while IFS= read -r p; do
@@ -829,6 +878,8 @@ cmd_score(){
   done
 
   _show_judge_report "$F" || true
+  # Winner is now resolvable non-interactively: `wtcp merge` merges it one-shot.
+  [ -n "$winner" ] && say "winner [$winner] — merge it with 'wtcp merge' (prefix Ctrl-R also offers it)"
   # After reading the report, offer a one-key winner pick that merges directly.
   [ "$COCKPIT_NO_INTERACTIVE_MENUS" = "1" ] || _winner_menu "$cwin"
 }
@@ -845,7 +896,7 @@ cmd_agents(){
     printf 'COCKPIT_AGENTS="%s"\n' "$val" >> "$WTCP_CONFIG"
   fi
   COCKPIT_AGENTS="$val"
-  echo "wtcp: compare set -> $val"
+  ok "compare set -> $val"
   _ensure_agent_configs
 }
 
@@ -856,9 +907,9 @@ _send_to_window(){
   while IFS= read -r p; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] || continue          # skip the bar/empty pane
     _send_to_pane "$p" "$text"
-    echo "-> $wt"; n=$((n+1))
+    printf '  %s->%s %s\n' "$C_DIM" "$C_OFF" "$wt"; n=$((n+1))
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
-  echo "wtcp: sent to $n agent(s)"
+  ok "sent to $n agent(s)"
 }
 
 cmd_send(){
@@ -912,6 +963,22 @@ cmd_winner(){
   _winner_menu "$cwin"
 }
 
+# One-shot "merge the judge's winner": resolve the scored winner from the pane
+# borders and hand it to the pick machinery (merge with changes / keep without).
+# This is the non-interactive complement to the winner menu — usable from the
+# bar, a script, or headless runs, right after `wtcp score`.
+cmd_merge(){
+  need_tmux
+  local cwin winner; cwin=$(_cur_win)
+  winner=$(_scored_winner "$cwin")
+  if [ -z "$winner" ]; then
+    tmux display-message "wtcp: no scored winner — run 'wtcp score' first" 2>/dev/null || true
+    die "no scored winner in this grid — run 'wtcp score' first, or 'wtcp pick <name>' to choose manually"
+  fi
+  say "merging the judge's winner [$winner]"
+  cmd_pick "$winner"
+}
+
 # Full-diff viewer. Worktree from $1 when given (the diff menu passes it),
 # else the focused agent pane; from the bar/empty pane, open the agent menu.
 cmd_diff(){
@@ -937,7 +1004,7 @@ cmd_copy(){
   [ -s "$F" ] || die "no judge report yet (run 'wtcp score' first)"
   if _copy_to_clipboard "$F"; then
     tmux display-message "wtcp: copied last judge report" 2>/dev/null || true
-    echo "wtcp: copied last judge report"
+    ok "copied last judge report"
   else
     cat "$F"
     die "no clipboard command found (need pbcopy, wl-copy, or xclip)"
@@ -1010,16 +1077,15 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   [ -n "$root" ]   && tmux set-option -w -t "$nwin" @cockpit_root "$root"
   [ -n "$prompt" ] && tmux set-option -w -t "$nwin" @cockpit_prompt "$prompt"
   [ -n "$base" ]   && tmux set-option -w -t "$nwin" @cockpit_base "$base"
-  tmux set-window-option -t "$nwin" pane-border-status top 2>/dev/null || true
-  tmux set-window-option -t "$nwin" pane-border-format ' #{@pane_label} ' 2>/dev/null || true
+  _style_window "$nwin"
   local l
   for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
   [ "$nwin" = "$cwin" ] || tmux kill-window -t "$cwin" 2>/dev/null || true
   tmux select-window -t "$nwin" 2>/dev/null || true
   tmux display-message "wtcp: kept [$keep] — talk to it directly; prefix Ctrl-F forks a new round from it" 2>/dev/null || true
-  echo "wtcp: kept [$keep] (worktree + live session, nothing merged). dropped: ${*:-(none)}"
-  echo "wtcp: continue in its pane. prefix Ctrl-F (or 'wtcp fork \"<prompt>\"') fans out a new"
-  echo "      multi-agent round from this agent's work; 'wtcp drop' discards it when done."
+  ok "kept [$keep] (worktree + live session, nothing merged). dropped: ${*:-(none)}"
+  say "continue in its pane. prefix Ctrl-F (or 'wtcp fork \"<prompt>\"') fans out a new"
+  echo "     multi-agent round from this agent's work; 'wtcp drop' discards it when done."
 }
 
 cmd_keep_menu(){ need_tmux; _keep_menu "$(_cur_win)"; }
@@ -1041,7 +1107,7 @@ cmd_keep(){
     losers+=("$wt")
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
   goto_root
-  echo "wtcp: keeping [$keep] as a live session (no merge)"
+  say "keeping [$keep] as a live session (no merge)"
   _keep_session "$cwin" "$keep" "${losers[@]:-}"
 }
 
@@ -1066,7 +1132,7 @@ cmd_pick(){
   local wpath base has_changes=1; wpath=$(_wm path "$winner" 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
     local msg; msg=$(tmux show-options -wqv -t "$cwin" @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
-    echo "wtcp: auto-committing the winner's uncommitted changes..."
+    say "auto-committing the winner's uncommitted changes..."
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" \
       || die "auto-commit failed for [$winner]; merge aborted so the worktree is preserved"
   fi
@@ -1080,11 +1146,11 @@ cmd_pick(){
   # the winner as a LIVE session instead so the conversation continues (its
   # scrollback holds the analysis; workmux merge would error on the empty branch).
   if [ "$has_changes" -eq 0 ]; then
-    echo "wtcp: winner [$winner] has no code changes vs base -> keeping its session (no merge)."
+    say "winner [$winner] has no code changes vs base -> keeping its session (no merge)."
     _keep_session "$cwin" "$winner" "${losers[@]:-}"
     return 0
   fi
-  echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
+  say "winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
   _wm merge "$winner" || { _merge_fail_recover "$winner"; exit 1; }
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
   # Close the grid/kept window — but only a wtcp-owned (wt:*) window. `wtcp
@@ -1092,7 +1158,7 @@ cmd_pick(){
   case "$(tmux display -p -t "$cwin" '#{window_name}' 2>/dev/null)" in
     "${WIN_PREFIX}:"*) tmux kill-window -t "$cwin" 2>/dev/null || true ;;
   esac
-  echo "wtcp: done. merged winner — keep working or start another round."
+  ok "done. merged winner — keep working or start another round."
 }
 
 cmd_drop(){
@@ -1100,7 +1166,7 @@ cmd_drop(){
   local fp wt; fp=$(_cur_pane); wt=$(pane_wt "$fp")
   [ -n "$wt" ] || die "put the cursor on the agent pane to drop (not the bar/empty pane)"
   goto_root
-  echo "wtcp: dropping [$wt] (remove worktree + close pane, grid re-tiles)"
+  say "dropping [$wt] (remove worktree + close pane, grid re-tiles)"
   _wm remove "$wt" -f || true
   tmux kill-pane -t "$fp" 2>/dev/null || true     # only the top grid re-flows; the bottom bar stays
 }
@@ -1117,7 +1183,8 @@ cmd_setup(){
   for k in R C-r; do
     tmux bind-key "$k" display-menu -T "wtcp review" \
       "Run LLM judge (score all)" r "run-shell \"$INVOKE_CMD score\"" \
-      "Pick winner to merge" p "run-shell \"$INVOKE_CMD winner\"" \
+      "Merge the scored winner" m "run-shell \"$INVOKE_CMD merge\"" \
+      "Pick winner to merge (menu)" p "run-shell \"$INVOKE_CMD winner\"" \
       "Keep a session (no merge)" k "run-shell \"$INVOKE_CMD keep-menu\"" \
       "View agent diff" d "run-shell \"$INVOKE_CMD diff\"" \
       "Show last result" v "run-shell \"$INVOKE_CMD show\"" \
@@ -1163,10 +1230,11 @@ cmd_setup(){
   # Keep lots of scrollback so `wtcp score` can feed the judge each agent's whole
   # session (set before the agent panes are created, so they inherit it).
   tmux set -g history-limit 100000
-  echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-K keep  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-F fork  ·  Ctrl-R review menu"
-  echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R lets you run the judge, show details, or copy the report."
-  echo "  Move/resize: prefix+arrow = move (o = cycle) · prefix+z = fullscreen one (z to return) · prefix+Ctrl-arrow = resize."
-  echo "  Scroll/copy: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D; y/Enter copies selection when a clipboard tool exists."
+  ok "keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-K keep  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-F fork  ·  Ctrl-R review menu"
+  printf '%s\n' \
+    "  ${C_DIM}Use Ctrl + the letter (works with the Korean IME). Ctrl-R runs the judge, merges the winner, shows reports.${C_OFF}" \
+    "  ${C_DIM}Move/resize: prefix+arrow = move (o = cycle) · prefix+z = fullscreen one (z to return) · prefix+Ctrl-arrow = resize.${C_OFF}" \
+    "  ${C_DIM}Scroll/copy: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D; y/Enter copies selection when a clipboard tool exists.${C_OFF}"
 }
 
 # Jump to the active grid window (overlay-like "button"). Most recent one.
@@ -1239,9 +1307,54 @@ cmd_doctor(){
 
 cmd_list(){ _wm list; }
 
+cmd_help(){
+  local T="$C_TAG" B="$C_BOLD" D="$C_DIM" O="$C_OFF"
+  cat <<EOF
+${T}wtcp${O} ${B}— Worktree Cockpit${O}
+  Run several coding agents on ONE prompt in an isolated tmux grid, then
+  review, score, and merge (or keep) the best.   ${D}workmux + tmux + git${O}
+
+${B}START A ROUND${O}                                                      ${D}alias  in-grid key${O}
+  wtcp start "<prompt>" [name]  one worktree per agent + broadcast + grid  ${D}b${O}
+  wtcp agents [names...]        show/set the compared agents ${D}(max 6)${O}
+
+${B}REVIEW & FINISH${O}
+  wtcp score            LLM judge ranks all agents + names a winner       ${D}r      prefix Ctrl-R${O}
+  wtcp merge            merge the judge's winner ${D}(one shot, no menu)${O}      ${D}m      prefix Ctrl-R${O}
+  wtcp winner           menu of scored agents -> merge the choice         ${D}       prefix Ctrl-R${O}
+  wtcp pick             merge the FOCUSED agent, drop the rest            ${D}p      prefix Ctrl-P${O}
+                        ${D}winner has no code changes? -> keeps the session${O}
+  wtcp keep [name]      keep ONE live session (no merge), drop the rest   ${D}k      prefix Ctrl-K${O}
+  wtcp send "<text>"    send a follow-up line to every agent              ${D}s      prefix Ctrl-S${O}
+  wtcp fork "<prompt>"  new round branched from the focused agent's WIP   ${D}f      prefix Ctrl-F${O}
+  wtcp diff [name]      an agent's FULL diff vs the round base (popup)    ${D}       prefix Ctrl-R${O}
+  wtcp show / copy      last judge report: popup / clipboard              ${D}cp${O}
+  wtcp drop             remove just the focused agent (grid re-tiles)     ${D}x      prefix Ctrl-X${O}
+  wtcp abandon          discard the whole grid, merge nothing             ${D}a${O}
+
+${B}WORKSPACE${O}
+  wtcp grid             jump to the newest wtcp window                    ${D}g${O}
+  wtcp list             list active worktrees                             ${D}ls${O}
+  wtcp clean            remove ALL compare worktrees + wtcp windows       ${D}clear${O}
+  wtcp setup            (re)install in-grid keys + mouse ${D}(start does this)${O}
+  wtcp doctor           environment check: tmux/mouse/agents/deps + tips
+
+${B}IN-GRID KEYS${O}  ${D}press your tmux prefix first — Ctrl+letter passes the Korean IME${O}
+  Ctrl-P pick·merge   Ctrl-K keep   Ctrl-X drop   Ctrl-S send-all   Ctrl-F fork   Ctrl-R review menu
+  z fullscreen (z returns)  ·  arrows move / o cycle  ·  [ scroll+copy  ·  mouse: click focus, wheel scroll
+
+${B}CONFIG${O}  ~/.config/wtcp/config   ${D}(sourced shell vars — template: wtcp.config.example)${O}
+  COCKPIT_AGENTS="claude codex opencode"          ${D}the compared agent set${O}
+  COCKPIT_AGENT_<ALIAS>_MODEL="opus"              ${D}same CLI, different model (claude/codex/opencode)${O}
+  COCKPIT_AGENT_<ALIAS>_CMD="env ... claude"      ${D}full command: other backends (e.g. GLM endpoint)${O}
+  COCKPIT_JUDGE_URL / _MODEL / _AUTH              ${D}OpenAI-compatible judge endpoint for 'wtcp score'${O}
+  ${D}'wtcp doctor' prints the exact launch command per agent and the live tmux state.${O}
+EOF
+}
+
 cmd_clean(){
   need_repo
-  echo "wtcp: removing all worktrees (except main) + closing grid windows..."
+  say "removing all worktrees (except main) + closing grid windows..."
   # 1) Remove worktrees FIRST. cmd_clean is often run from the grid's bottom bar
   #    pane; step 2 kills that window — which would terminate this script before
   #    the removal ran (the old "have to run clean twice" bug). Do removal first
@@ -1273,14 +1386,16 @@ case "${1:-}" in
   grid|g)            shift; cmd_grid "$@";;
   score|r)           shift; cmd_score "$@";;
   winner)            shift; cmd_winner "$@";;
+  merge|m)           shift; cmd_merge "$@";;
   diff)              shift; cmd_diff "$@";;
   show)              shift; cmd_show "$@";;
   copy|cp)           shift; cmd_copy "$@";;
   agents)            shift; cmd_agents "$@";;
   setup)             shift; cmd_setup "$@";;
+  bar-banner)        shift; cmd_bar_banner "$@";;
   doctor)            shift; cmd_doctor "$@";;
   list|ls)           shift; cmd_list "$@";;
   clean|clear)       shift; cmd_clean "$@";;
-  ""|-h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$SELF";;
+  ""|-h|--help|help) cmd_help;;
   *) die "unknown command: $1 (try: wtcp help)";;
 esac

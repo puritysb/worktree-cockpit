@@ -72,11 +72,11 @@ wtcp start "add a CONTRIBUTING.md"
 ```
 
 Once the grid opens, review the panes. If a judge endpoint is configured, use
-`prefix Ctrl-R` to open the review menu: run the LLM judge, **view any agent's
-full diff**, show the detailed report, copy the last result, or **pick the
-winner to merge** (a menu of the scored agents, best first — choosing one merges
-it directly). You can also focus any pane and use `prefix Ctrl-P` to pick it
-yourself. If the round was analysis-only (the winner has no code diff), picking
+`prefix Ctrl-R` to open the review menu: run the LLM judge, **merge the scored
+winner in one step** (`wtcp merge` — no menu, it reads the judge's 🏆/top score),
+pick a winner from a menu, **view any agent's full diff**, show the detailed
+report, or copy the last result. You can also focus any pane and use
+`prefix Ctrl-P` to pick it yourself. If the round was analysis-only (the winner has no code diff), picking
 **keeps that agent as a live session** instead of merging, so you can continue
 the conversation — see
 [Analysis rounds](#analysis-rounds--keep-a-session-instead-of-merging).
@@ -125,7 +125,7 @@ The grid installs its keybindings automatically. In the grid, with your tmux
 | `Ctrl-X` | **drop** just the focused pane (grid re-tiles) |
 | `Ctrl-S` | **send** a follow-up instruction to *every* agent |
 | `Ctrl-F` | **fork**: type a prompt in a popup → new multi-agent round branched from the focused agent's work |
-| `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, keep a session, view an agent's full diff, show the detailed report, or copy the last result |
+| `Ctrl-R` | **review menu**: run the judge LLM, merge the scored winner (one step), pick a winner from a menu, keep a session, view an agent's full diff, show the detailed report, or copy the last result |
 | `z` | fullscreen the focused agent (again to return) · arrows move between agents |
 | `[` | scroll/copy a pane (mouse wheel scrolls; drag to select copies to the clipboard; `Ctrl-U`/`Ctrl-D` page, `y`/`Enter` copy, `q` exits) |
 
@@ -135,9 +135,11 @@ events directly, other panes scroll tmux history.
 
 Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
-Other commands: `wtcp send "..."`, `wtcp keep [name]` (keep one agent's live
-session, drop the rest — no merge), `wtcp fork "..."` (new round from a pane's
-WIP), `wtcp winner` (menu to pick the scored winner and merge it),
+Other commands: `wtcp send "..."`, `wtcp merge` (merge the **judge's winner**
+in one shot — reads the scored 🏆/top-★ pane, then runs the normal pick
+machinery), `wtcp keep [name]` (keep one agent's live session, drop the rest —
+no merge), `wtcp fork "..."` (new round from a pane's WIP), `wtcp winner`
+(menu to pick the scored winner and merge it),
 `wtcp diff [name]` (an agent's **full** diff vs the round base in a popup — the
 focused pane's agent, or a menu; rendered with [delta](https://github.com/dandavison/delta)
 when installed), `wtcp show` (last judge report), `wtcp copy` (copy last judge
@@ -240,6 +242,12 @@ while output is evidence for tests run, claims made, and analysis quality. Empty
 diffs are valid for analysis/review tasks and are not penalized by themselves.
 The popup shows a short bullet report; each pane border gets its score. It falls
 back to independent per-agent scoring if the comparison can't be parsed.
+
+After scoring, **`wtcp merge`** merges the winner's branch without any menu: it
+reads the 🏆-marked pane (or the highest ★ score when there is no trophy) and
+runs the same pick machinery — merge when the winner has code changes, keep the
+session when it doesn't. The winner menu (`prefix Ctrl-R`) remains for choosing
+a different agent than the judge's pick.
 
 The judge sees as much context as fits its window — the full diff plus each
 agent's whole pane scrollback, budgeted by the `*_CHARS` vars below.

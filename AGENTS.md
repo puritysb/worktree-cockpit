@@ -33,8 +33,13 @@ This file is the design/gotcha memory for working ON wtcp itself.
   They call back via `$INVOKE <verb>` (INVOKE resolves to `wtcp` on PATH).
 - `cmd_score` does **comparative** judging (all agents in one LLM call → rank +
   winner), falling back to independent per-agent scoring (`_score_independent`).
-- `prefix Ctrl-R` opens a `display-menu` (run judge / pick-winner / view-diff /
-  show / copy). After scoring — and via `wtcp winner` / the menu's "pick winner" —
+- `wtcp merge` is the NON-interactive winner merge: `_scored_winner` reads the
+  🏆-marked pane label (comparative scoring), else the top numeric ★ from
+  `_scored_rows`, and hands the name to `cmd_pick` (so the diff/no-diff split
+  applies). Refuses when nothing is scored. The menus stay for manual choice.
+- `prefix Ctrl-R` opens a `display-menu` (run judge / merge-winner / pick-winner
+  menu / keep / view-diff / show / copy). After scoring — and via `wtcp winner` /
+  the menu's "pick winner" —
   `_winner_menu` reads the ★scores stamped on each pane border (via `_scored_rows`:
   unjudged `★ ?` panes get sort key −1 so they land LAST — `?` is text and would
   otherwise sort above numbers under `sort -rn`), ranks best-first, and a selection
@@ -67,6 +72,13 @@ This file is the design/gotcha memory for working ON wtcp itself.
   jumps to them; `wtcp drop` in a kept window removes worktree + window.
 - `_show_judge_report` opens the report popup WITHOUT less's `-F`
   (which would auto-quit and flash the popup shut when the report fits one screen).
+- Visual chrome: `_style_window` (heavy dim borders, bright active border, bold
+  border labels, the bar label highlighted via `#{?#{@cockpit_bar},...}`) is
+  applied to grid/kept windows by `_run_round`/`_keep_session`/`cmd_score` — keep
+  them in sync. The bar pane opens with `wtcp bar-banner` (colored cheatsheet)
+  before its shell. stdout logs go through `say`/`ok`/`die` (cyan tag / green ✔ /
+  red ✗; plain when piped or NO_COLOR). `wtcp help` is `cmd_help` (structured,
+  colorized), no longer the raw header-comment dump.
 
 ## Hard-won gotchas (do not regress these)
 
