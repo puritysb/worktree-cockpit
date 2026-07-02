@@ -76,7 +76,10 @@ Once the grid opens, review the panes. If a judge endpoint is configured, use
 full diff**, show the detailed report, copy the last result, or **pick the
 winner to merge** (a menu of the scored agents, best first — choosing one merges
 it directly). You can also focus any pane and use `prefix Ctrl-P` to pick it
-yourself.
+yourself. If the round was analysis-only (the winner has no code diff), picking
+**keeps that agent as a live session** instead of merging, so you can continue
+the conversation — see
+[Analysis rounds](#analysis-rounds--keep-a-session-instead-of-merging).
 
 ## LLM endpoint
 
@@ -117,16 +120,23 @@ The grid installs its keybindings automatically. In the grid, with your tmux
 
 | Key | Action |
 |-----|--------|
-| `Ctrl-P` | **pick** focused pane as winner → auto-commit + merge into the workmux main branch, drop the rest |
+| `Ctrl-P` | **pick** focused pane as winner → auto-commit + merge into the workmux main branch, drop the rest. A winner with **no code changes** is **kept as a live session** instead (see [Analysis rounds](#analysis-rounds--keep-a-session-instead-of-merging)) |
+| `Ctrl-K` | **keep** the focused agent's live session (own window, **no merge**), drop the other agents and the grid |
 | `Ctrl-X` | **drop** just the focused pane (grid re-tiles) |
 | `Ctrl-S` | **send** a follow-up instruction to *every* agent |
-| `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, view an agent's full diff, show the detailed report, or copy the last result |
+| `Ctrl-F` | **fork**: type a prompt in a popup → new multi-agent round branched from the focused agent's work |
+| `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, keep a session, view an agent's full diff, show the detailed report, or copy the last result |
 | `z` | fullscreen the focused agent (again to return) · arrows move between agents |
 | `[` | scroll/copy a pane (mouse wheel scrolls; drag to select copies to the clipboard; `Ctrl-U`/`Ctrl-D` page, `y`/`Enter` copy, `q` exits) |
 
+Clicking any pane (focused or not) selects it; the mouse wheel scrolls the pane
+**under the cursor** — agents that handle the mouse themselves get the wheel
+events directly, other panes scroll tmux history.
+
 Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
-Other commands: `wtcp send "..."`, `wtcp fork "..."` (new round from a pane's
+Other commands: `wtcp send "..."`, `wtcp keep [name]` (keep one agent's live
+session, drop the rest — no merge), `wtcp fork "..."` (new round from a pane's
 WIP), `wtcp winner` (menu to pick the scored winner and merge it),
 `wtcp diff [name]` (an agent's **full** diff vs the round base in a popup — the
 focused pane's agent, or a menu; rendered with [delta](https://github.com/dandavison/delta)
@@ -140,11 +150,48 @@ for the full list.
 | Command | Effect |
 |---------|--------|
 | `wtcp start` | creates one worktree/branch per configured agent and opens the grid |
-| `wtcp pick` | commits the focused winner if needed, merges it when it has code changes, removes the other round worktrees, and closes the grid |
+| `wtcp pick` | commits the focused winner if needed; **with code changes** merges it, removes the other round worktrees, and closes the grid; **without code changes** keeps the winner as a live session (like `wtcp keep`) |
+| `wtcp keep` | moves one agent's pane into its own window (worktree + running agent survive, nothing merged), removes the other agents' worktrees, closes the grid |
 | `wtcp drop` | removes only the focused agent's worktree/pane |
 | `wtcp fork` | commits the focused pane's WIP as a base and starts another round from it |
 | `wtcp abandon` | removes the current grid's worktrees without merging anything |
-| `wtcp clean` | removes all compare worktrees and closes wtcp grid windows |
+| `wtcp clean` | removes all compare worktrees and closes wtcp grid windows (kept sessions included) |
+
+## Analysis rounds — keep a session instead of merging
+
+Not every round produces code. When you ask the agents to *analyze*, *review*,
+or *answer a question*, the "result" is the conversation in the winning pane —
+there is nothing to merge, but you usually want to **continue working with that
+agent**.
+
+That's what **keep** does (`prefix Ctrl-K` on the focused pane, the review
+menu's *Keep a session*, or `wtcp keep [name]`):
+
+- the kept agent's pane moves to its **own tmux window** — the worktree and the
+  **running agent session (full conversation context) survive**;
+- the other agents' worktrees are removed and the grid closes;
+- nothing is merged.
+
+`wtcp pick` chooses automatically based on the diff: a winner **with code
+changes** is merged as usual; a winner **with no code changes vs the round
+base** is kept as a live session instead. So you can always score with
+`prefix Ctrl-R` and pick the winner — wtcp does the right thing for both kinds
+of rounds.
+
+**Continuing from a kept session.** Type follow-ups directly in the kept pane —
+it's the same agent, same conversation. When a follow-up deserves another
+multi-agent comparison, press **`prefix Ctrl-F`** (fork): type the new prompt in
+the popup and a fresh grid launches, with every agent **branched from the kept
+agent's work**. Rounds can alternate naturally: fan out → keep one → continue →
+fan out again.
+
+> Tip: before forking from an analysis-only session, ask the kept agent to
+> write its findings to a file (e.g. `NOTES.md`). `wtcp fork` auto-commits the
+> worktree's WIP, so the new round's agents all start with those findings —
+> otherwise the analysis exists only in the kept pane's scrollback.
+
+When you're done with a kept session, `prefix Ctrl-X` (drop) removes its
+worktree and closes the window.
 
 ## Troubleshooting
 
@@ -206,23 +253,47 @@ It also shows a `Judge model:` line naming the model the endpoint actually used.
 `wtcp copy` copies the last report from `~/.config/wtcp/judge.txt` to the system
 clipboard (`pbcopy`, `wl-copy`, or `xclip`).
 
-## Comparing Model Variants
+## Comparing models and backends
 
 `COCKPIT_AGENTS` entries are workmux agent names and must be unique because they
-become branch/worktree suffixes. To compare the same CLI with different models or
-backends, use aliases and map each alias to a command:
+become branch/worktree suffixes. To compare the **same CLI with different
+models**, give each variant an alias and set its model — wtcp launches the
+alias's base CLI with `--model`:
 
 ```sh
-COCKPIT_AGENTS="claude-sonnet claude-mlx codex-gpt5 codex-mlx"
-COCKPIT_AGENT_CLAUDE_SONNET_CMD="claude --model sonnet"
-COCKPIT_AGENT_CLAUDE_MLX_CMD="claude --model mlx"
-COCKPIT_AGENT_CODEX_GPT5_CMD="codex --model gpt-5"
-COCKPIT_AGENT_CODEX_MLX_CMD="codex --model mlx"
+# claude vs claude: which model handles this prompt better?
+COCKPIT_AGENTS="claude-fable claude-opus claude-sonnet"
+COCKPIT_AGENT_CLAUDE_FABLE_MODEL="fable"
+COCKPIT_AGENT_CLAUDE_OPUS_MODEL="opus"
+COCKPIT_AGENT_CLAUDE_SONNET_MODEL="sonnet"
 ```
 
-Aliases starting with `claude-`, `codex-`, or `agy-` inherit the right trust-store
-handling. For other names, set `COCKPIT_AGENT_<ALIAS>_KIND`, for example
-`COCKPIT_AGENT_MY_ALIAS_KIND="codex"`.
+`COCKPIT_AGENT_<ALIAS>_MODEL` accepts anything the CLI's `--model` flag accepts
+(an alias like `opus`, or a full model id). It works for any alias whose kind is
+a real CLI: `codex-gpt5` + `COCKPIT_AGENT_CODEX_GPT5_MODEL="gpt-5"` launches
+`codex --model gpt-5`. `wtcp doctor` prints the exact command each alias will
+launch.
+
+For anything `--model` can't express — a different **backend** behind the same
+CLI, extra flags, env vars — set `COCKPIT_AGENT_<ALIAS>_CMD` with the full
+command instead (it wins over `_MODEL`). That is how you attach **GLM (or any
+Anthropic-compatible endpoint) to Claude Code** and race it against the stock
+models:
+
+```sh
+COCKPIT_AGENTS="claude-fable claude-glm"
+COCKPIT_AGENT_CLAUDE_FABLE_MODEL="fable"
+# Claude Code CLI pointed at Zhipu's GLM endpoint (any Anthropic-compatible API works):
+COCKPIT_AGENT_CLAUDE_GLM_CMD="env ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-... ANTHROPIC_MODEL=glm-4.6 claude"
+```
+
+Both variants run side by side in the grid, get scored by the judge like any
+other agents, and the winner merges the same way.
+
+Aliases starting with `claude-`, `codex-`, or `agy-` inherit the right
+trust-store handling and `COCKPIT_TRUST` launch flags. For other names, set
+`COCKPIT_AGENT_<ALIAS>_KIND`, for example `COCKPIT_AGENT_MY_ALIAS_KIND="codex"`
+(the kind is also the CLI that `_MODEL` aliases launch).
 
 ## Grid layout
 
@@ -251,8 +322,9 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_NO_INTERACTIVE_MENUS` | `0` | `1` = never auto-open the winner menu after scoring (headless runs) |
 | `COCKPIT_TRUST` | `0` | **opt-in**: skip the per-agent folder-trust dialog + auto-approve tool use so new projects auto-start (edits the agents' trust stores + global workmux config) |
 | `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD` | _(see below)_ | override how claude/codex launch under `COCKPIT_TRUST` |
-| `COCKPIT_AGENT_<ALIAS>_CMD` | _(empty)_ | command used for a custom/variant agent alias |
-| `COCKPIT_AGENT_<ALIAS>_KIND` | inferred | base kind for alias trust handling (`claude`, `codex`, `agy`, etc.) |
+| `COCKPIT_AGENT_<ALIAS>_CMD` | _(empty)_ | full command for a custom/variant agent alias (env vars, backends, extra flags; wins over `_MODEL`) |
+| `COCKPIT_AGENT_<ALIAS>_MODEL` | _(empty)_ | model for an alias: launches the alias kind's CLI with `--model <value>` |
+| `COCKPIT_AGENT_<ALIAS>_KIND` | inferred | base kind for alias trust handling and the CLI `_MODEL` launches (`claude`, `codex`, `agy`, etc.) |
 
 Raise the `*_CHARS` budgets for a bigger-context judge model; lower them for a
 small local one (char ≈ ⅓–¼ token, so keep the total under the model's window).

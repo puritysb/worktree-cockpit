@@ -29,8 +29,8 @@ This file is the design/gotcha memory for working ON wtcp itself.
   agent and launches it, then **join-pane** pulls each agent's pane into one grid
   window, a full-width command bar is added at the bottom, and the grid is laid out.
 - In-grid actions are tmux keybindings installed by `cmd_setup` (run automatically
-  by `cmd_broadcast`): prefix + Ctrl-P/X/R/S → pick/drop/score/send. They call back
-  via `$INVOKE <verb>` (INVOKE resolves to `wtcp` on PATH).
+  by `cmd_broadcast`): prefix + Ctrl-P/K/X/R/S/F → pick/keep/drop/score/send/fork.
+  They call back via `$INVOKE <verb>` (INVOKE resolves to `wtcp` on PATH).
 - `cmd_score` does **comparative** judging (all agents in one LLM call → rank +
   winner), falling back to independent per-agent scoring (`_score_independent`).
 - `prefix Ctrl-R` opens a `display-menu` (run judge / pick-winner / view-diff /
@@ -49,9 +49,23 @@ This file is the design/gotcha memory for working ON wtcp itself.
   delta's default pager includes `-F`, the popup flash-close gotcha) else
   `git diff --color=always` + `less -R`. Writes `~/.config/wtcp/diff.txt` even
   headless (the test observable).
-- `cmd_pick` skips `workmux merge` when the winner has NO changes vs `@cockpit_base`
-  (analysis/research round) and just cleans up — `workmux merge` errors on an
-  empty branch. `_show_judge_report` opens the report popup WITHOUT less's `-F`
+- `cmd_pick` branches on the diff: a winner WITH changes vs `@cockpit_base` merges
+  as usual; a winner with NO changes (analysis/research round) is handed to
+  `_keep_session` instead — `workmux merge` errors on an empty branch, and the
+  valuable output there is the conversation in the pane, so keep it alive.
+  `wtcp keep` (prefix Ctrl-K; the review menu calls `keep-menu` so it always
+  offers the agent list) does the same explicitly for any agent, diff or not.
+- `_keep_session` = break-pane the keeper into its own `wt:<worktree>` window,
+  remove the losers' worktrees, kill the grid. It must COPY `@cockpit_root` /
+  `@cockpit_prompt` / `@cockpit_base` onto the new window (window options do NOT
+  survive break-pane) or goto_root/diff/fork stop working from the kept window;
+  `@worktree`/`@pane_label` are PANE options and DO survive. A kept window has no
+  shell pane, so `prefix Ctrl-F` (display-popup → `cmd_prompt_fork` → `cmd_fork`)
+  is how it fans out a new multi-agent round (fork auto-commits WIP, so asking the
+  kept agent to write findings to a file first carries them into the new round).
+  Kept windows match the `wt:` prefix, so `cmd_clean` closes them and `cmd_grid`
+  jumps to them; `wtcp drop` in a kept window removes worktree + window.
+- `_show_judge_report` opens the report popup WITHOUT less's `-F`
   (which would auto-quit and flash the popup shut when the report fits one screen).
 
 ## Hard-won gotchas (do not regress these)
@@ -89,6 +103,14 @@ This file is the design/gotcha memory for working ON wtcp itself.
    `history-limit 100000`). history-limit is raised so `wtcp score` can feed the
    judge each agent's whole pane scrollback. mouse-on is global (tmux has no
    per-window mouse) — to copy text users hold ⌥Option while dragging.
+   **Mouse bindings must target the pane under the mouse (`-t=`) and respect
+   `mouse_any_flag`.** The old `WheelUpPane` binding forced copy-mode with no
+   `-t=`: mouse-aware agent TUIs (claude/codex enable mouse reporting) never got
+   wheel events so their own viewport wouldn't scroll, and on older tmux the
+   ACTIVE pane scrolled instead of the hovered one. Current bindings mirror the
+   tmux 3.x defaults (`if -Ft= '#{||:#{pane_in_mode},#{mouse_any_flag}}' send -M`
+   else `copy-mode -e -t=`) plus an explicit `MouseDown1Pane 'select-pane -t= ;
+   send-keys -M'` so click-to-focus survives user config overrides.
 8. **`wtcp clean` must remove worktrees BEFORE killing windows** — it is usually run
    from the grid's bottom bar pane, and killing that window would otherwise end the
    script before removal (the old "run clean twice" bug). Kills its own window last.
@@ -124,7 +146,8 @@ This file is the design/gotcha memory for working ON wtcp itself.
 
 ## Config vars (all `COCKPIT_*`, set in `~/.config/wtcp/config`)
 
-Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD`,
+Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD` (full command, wins),
+`COCKPIT_AGENT_<ALIAS>_MODEL` (kind CLI + `--model`; see `_agent_launch_cmd`),
 `COCKPIT_AGENT_<ALIAS>_KIND`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
 `COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`,
 `COCKPIT_AGY_DELAY`, `COCKPIT_LAUNCH_TIMEOUT`.

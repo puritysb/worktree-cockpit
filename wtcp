@@ -10,9 +10,11 @@
 #   wtcp winner                                 prefix Ctrl-R menu: pick the winning agent (best score first) -> merge it
 #   wtcp diff [name]                            prefix Ctrl-R view an agent's FULL diff vs the round base (focused pane, or menu)
 #   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
+#                                                             (a winner with NO code changes is KEPT as a live session instead of merged)
+#   wtcp keep [name]                    k       prefix Ctrl-K keep ONE agent's live session (own window, no merge), drop the rest + grid
 #   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
 #   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
-#   wtcp fork "<prompt>"                f                     start a new round from the focused agent's WIP (no merge)
+#   wtcp fork "<prompt>"                f       prefix Ctrl-F start a new round from the focused agent's WIP (no merge)
 #   wtcp abandon                        a                     discard the whole grid, merge nothing
 #   wtcp grid                           g                     jump to the grid window
 #   wtcp agents [names...]                                    show / set the agents compared (default: claude codex opencode)
@@ -22,7 +24,7 @@
 #   wtcp doctor                                               check tmux/mouse/agents/deps + print troubleshooting tips
 #
 # IN-GRID KEYS — press your tmux prefix, then:
-#   Ctrl-P pick   ·   Ctrl-X drop   ·   Ctrl-R review menu   ·   Ctrl-S send-all
+#   Ctrl-P pick   ·   Ctrl-K keep   ·   Ctrl-X drop   ·   Ctrl-R review menu   ·   Ctrl-S send-all   ·   Ctrl-F fork
 #   z = fullscreen the focused agent (z again to return)   ·   arrows = move · o = cycle
 #   Ctrl-arrows = resize the focused agent (Alt-arrows = resize bigger steps)   ·   [ = scroll
 #   (Use Ctrl+letter — it passes through the Korean IME. Mouse wheel scrolls; click selects a pane.)
@@ -53,7 +55,7 @@ WIN_PREFIX="wt"
 BAR_HEIGHT=6
 # Always-visible shortcut cheatsheet (shown on the command-bar pane border).
 # Use Ctrl + the letter; the Ctrl variant passes through the Korean IME.
-BAR_KEYS='wtcp (prefix, then)   Ctrl-P pick · Ctrl-X drop · Ctrl-S send-all · Ctrl-R review menu (score/pick-winner)      |      z = fullscreen one · arrows = move · [ = scroll'
+BAR_KEYS='wtcp (prefix, then)   Ctrl-P pick(merge) · Ctrl-K keep(no merge) · Ctrl-X drop · Ctrl-S send-all · Ctrl-F fork · Ctrl-R review menu    |    z = fullscreen one · arrows = move · [ = scroll'
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # Path the keybindings call back through. Prefer `wtcp` on PATH; fall back to this
 # script's absolute path. COCKPIT_INVOKE overrides (e.g. a wrapper command).
@@ -106,6 +108,33 @@ _agent_kind(){
     agy|agy-*|agy_*)         printf 'agy' ;;
     *)                       printf '%s' "$a" ;;
   esac
+}
+_agent_model(){
+  local key var
+  key=$(_agent_env_key "$1"); var="COCKPIT_AGENT_${key}_MODEL"
+  printf '%s' "${!var-}"
+}
+# The launch command wtcp writes into the workmux agent map for this alias:
+#   1. COCKPIT_AGENT_<ALIAS>_CMD verbatim (env prefixes, alternate backends, ...)
+#   2. else the alias kind's CLI (+ COCKPIT_TRUST flags) + `--model <_MODEL>`
+#   3. else empty -> keep workmux's builtin default for the name
+# agy is handled separately (prompt-loading wrapper) in _ensure_agent_configs.
+_agent_launch_cmd(){
+  local a="$1" cmd kind model base
+  cmd=$(_agent_cmd "$a")
+  if [ -n "$cmd" ]; then printf '%s' "$cmd"; return 0; fi
+  kind=$(_agent_kind "$a"); model=$(_agent_model "$a")
+  case "$kind" in
+    claude) if [ "${COCKPIT_TRUST:-0}" = 1 ]; then base="${COCKPIT_CLAUDE_CMD:-claude --permission-mode auto}"; else base="claude"; fi ;;
+    codex)  if [ "${COCKPIT_TRUST:-0}" = 1 ]; then base="${COCKPIT_CODEX_CMD:-codex --dangerously-bypass-approvals-and-sandbox}"; else base="codex"; fi ;;
+    *)      base="$kind" ;;
+  esac
+  if [ -n "$model" ]; then printf '%s --model %s' "$base" "$model"; return 0; fi
+  # No model override: only trust-mode claude/codex need a rewritten command.
+  case "$kind" in
+    claude|codex) [ "${COCKPIT_TRUST:-0}" = 1 ] && printf '%s' "$base" ;;
+  esac
+  return 0
 }
 # Absolute worktree path (workmux path -> fallback to <repo>__worktrees/<wt>).
 _wt_path(){
@@ -223,17 +252,16 @@ _ensure_agent_configs(){
   local a flag="" kind cmd
   [ "${COCKPIT_TRUST:-0}" = 1 ] && flag="--dangerously-skip-permissions "
   for a in $COCKPIT_AGENTS; do
-    cmd=$(_agent_cmd "$a")
-    if [ -n "$cmd" ]; then _set_agent_cfg "$a" "$cmd"; continue; fi
     kind=$(_agent_kind "$a")
-    case "$kind" in
-    agy)
+    if [ "$kind" = agy ] && [ -z "$(_agent_cmd "$a")" ]; then
       local W="$HOME/.config/wtcp/agy-wm"; mkdir -p "$(dirname "$W")"
       printf '#!/bin/sh\np=$(cat .workmux/PROMPT-*.md 2>/dev/null)\nexec agy %s-i "$p"\n' "$flag" > "$W"; chmod +x "$W"
-      _set_agent_cfg "$a" "$W" ;;
-    claude) [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg "$a" "${COCKPIT_CLAUDE_CMD:-claude --permission-mode auto}" ;;
-    codex)  [ "${COCKPIT_TRUST:-0}" = 1 ] && _set_agent_cfg "$a" "${COCKPIT_CODEX_CMD:-codex --dangerously-bypass-approvals-and-sandbox}" ;;
-  esac; done
+      _set_agent_cfg "$a" "$W"
+      continue
+    fi
+    cmd=$(_agent_launch_cmd "$a")
+    [ -n "$cmd" ] && _set_agent_cfg "$a" "$cmd"
+  done
   return 0
 }
 
@@ -681,6 +709,7 @@ _agent_menu(){   # $1=grid window $2=menu title $3=verb (pick|diff)
 }
 _winner_menu(){ _agent_menu "$1" "wtcp — pick winner to merge" pick; }
 _diff_menu(){   _agent_menu "$1" "wtcp — view agent diff" diff; }
+_keep_menu(){   _agent_menu "$1" "wtcp — keep agent session (no merge)" keep; }
 
 # Fallback: judge each agent independently (used if comparative parsing fails).
 _score_independent(){
@@ -836,6 +865,22 @@ cmd_prompt_send(){
   _send_to_window "$cwin" "$text"
 }
 
+# Popup prompt -> `wtcp fork` from the focused agent pane. This is how a KEPT
+# session fans out again: its window has no shell pane, so prefix Ctrl-F opens
+# this popup, and the new round branches from the kept agent's work.
+cmd_prompt_fork(){
+  need_tmux
+  local text
+  if [ -t 0 ]; then
+    printf 'fork round from this agent — prompt: ' > /dev/tty
+    IFS= read -r text < /dev/tty || die 'fork canceled'
+  else
+    IFS= read -r text || die 'fork canceled'
+  fi
+  [ -n "$text" ] || die 'fork prompt was empty'
+  cmd_fork "$text"
+}
+
 cmd_show(){
   need_tmux
   _show_judge_report "$(_judge_file)"
@@ -910,6 +955,66 @@ _merge_fail_recover(){   # $1=winner worktree
   } >&2
 }
 
+# Keep ONE agent's live session and dismantle the rest of the round: break its
+# pane out into its own window (worktree + running agent survive, nothing is
+# merged), remove the other agents' worktrees, close the grid. Made for
+# analysis/review rounds — continue the conversation in the kept pane, then
+# `wtcp fork "<prompt>"` (prefix Ctrl-F) fans out a new multi-agent round from
+# that agent's work, or `wtcp drop` discards it.
+_keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
+  local cwin="$1" keep="$2"; shift 2
+  local kp="" p wt
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p")
+    [ "$wt" = "$keep" ] && { kp="$p"; break; }
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  [ -n "$kp" ] || die "no pane for [$keep] in this grid"
+  # Carry the round context onto the kept pane's new window so goto_root, diff,
+  # and fork keep working from it (window options don't survive break-pane).
+  local root prompt base nwin
+  root=$(tmux show-options -wqv -t "$cwin" @cockpit_root 2>/dev/null || true)
+  prompt=$(tmux show-options -wqv -t "$cwin" @cockpit_prompt 2>/dev/null || true)
+  base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
+  nwin=$(tmux break-pane -d -P -F '#{window_id}' -s "$kp" -n "${WIN_PREFIX}:${keep}") \
+    || die "could not break [$keep] out of the grid"
+  [ -n "$root" ]   && tmux set-option -w -t "$nwin" @cockpit_root "$root"
+  [ -n "$prompt" ] && tmux set-option -w -t "$nwin" @cockpit_prompt "$prompt"
+  [ -n "$base" ]   && tmux set-option -w -t "$nwin" @cockpit_base "$base"
+  tmux set-window-option -t "$nwin" pane-border-status top 2>/dev/null || true
+  tmux set-window-option -t "$nwin" pane-border-format ' #{@pane_label} ' 2>/dev/null || true
+  local l
+  for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
+  tmux kill-window -t "$cwin" 2>/dev/null || true
+  tmux select-window -t "$nwin" 2>/dev/null || true
+  tmux display-message "wtcp: kept [$keep] — talk to it directly; prefix Ctrl-F forks a new round from it" 2>/dev/null || true
+  echo "wtcp: kept [$keep] (worktree + live session, nothing merged). dropped: ${*:-(none)}"
+  echo "wtcp: continue in its pane. prefix Ctrl-F (or 'wtcp fork \"<prompt>\"') fans out a new"
+  echo "      multi-agent round from this agent's work; 'wtcp drop' discards it when done."
+}
+
+cmd_keep_menu(){ need_tmux; _keep_menu "$(tmux display -p '#{window_id}')"; }
+
+# Keep the focused agent (or $1 from the menu/CLI); from the bar pane, open a menu.
+cmd_keep(){
+  need_tmux
+  local cwin keep; cwin=$(tmux display -p '#{window_id}')
+  if [ -n "${1:-}" ]; then
+    keep="$1"
+  else
+    keep=$(pane_wt "$(tmux display -p '#{pane_id}')")
+    if [ -z "$keep" ]; then _keep_menu "$cwin"; return 0; fi
+  fi
+  local losers=() p wt
+  while IFS= read -r p; do
+    wt=$(pane_wt "$p"); [ -z "$wt" ] && continue   # skip bar/empty panes
+    [ "$wt" = "$keep" ] && continue
+    losers+=("$wt")
+  done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  goto_root
+  echo "wtcp: keeping [$keep] as a live session (no merge)"
+  _keep_session "$cwin" "$keep" "${losers[@]:-}"
+}
+
 cmd_pick(){
   need_tmux
   # Winner is $1 when given (e.g. the winner-pick menu passes the worktree name),
@@ -941,22 +1046,19 @@ cmd_pick(){
       has_changes=0
     fi
   fi
-  echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
-  local did_merge=0
-  if [ "$has_changes" -eq 1 ]; then
-    _wm merge "$winner" || { _merge_fail_recover "$winner"; exit 1; }
-    did_merge=1
-  else
-    echo "wtcp: winner has no code changes vs base; skipping workmux merge."
-    _wm remove "$winner" -f || true
+  # Analysis/research round (no code changes vs base): nothing to merge — keep
+  # the winner as a LIVE session instead so the conversation continues (its
+  # scrollback holds the analysis; workmux merge would error on the empty branch).
+  if [ "$has_changes" -eq 0 ]; then
+    echo "wtcp: winner [$winner] has no code changes vs base -> keeping its session (no merge)."
+    _keep_session "$cwin" "$winner" "${losers[@]:-}"
+    return 0
   fi
+  echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
+  _wm merge "$winner" || { _merge_fail_recover "$winner"; exit 1; }
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
   tmux kill-window -t "$cwin" 2>/dev/null || true
-  if [ "$did_merge" -eq 1 ]; then
-    echo "wtcp: done. merged winner — keep working or start another round."
-  else
-    echo "wtcp: done. no code changes to merge — keep working or start another round."
-  fi
+  echo "wtcp: done. merged winner — keep working or start another round."
 }
 
 cmd_drop(){
@@ -976,11 +1078,13 @@ cmd_setup(){
   # composed into Hangul), so prefix -> C-p etc. work without switching input.
   local k
   for k in P C-p; do tmux bind-key "$k" run-shell "$INVOKE_CMD pick"; done
+  for k in K C-k; do tmux bind-key "$k" run-shell "$INVOKE_CMD keep"; done
   for k in X C-x; do tmux bind-key "$k" run-shell "$INVOKE_CMD drop"; done
   for k in R C-r; do
     tmux bind-key "$k" display-menu -T "wtcp review" \
       "Run LLM judge (score all)" r "run-shell \"$INVOKE_CMD score\"" \
       "Pick winner to merge" p "run-shell \"$INVOKE_CMD winner\"" \
+      "Keep a session (no merge)" k "run-shell \"$INVOKE_CMD keep-menu\"" \
       "View agent diff" d "run-shell \"$INVOKE_CMD diff\"" \
       "Show last result" v "run-shell \"$INVOKE_CMD show\"" \
       "Copy last result" c "run-shell \"$INVOKE_CMD copy\"" \
@@ -988,6 +1092,7 @@ cmd_setup(){
       "Cancel" q ""
   done
   for k in S C-s; do tmux bind-key "$k" display-popup -E "$INVOKE_CMD prompt-send"; done
+  for k in F C-f; do tmux bind-key "$k" display-popup -E "$INVOKE_CMD prompt-fork"; done
   # Make the small grid panes reviewable: mouse-wheel scroll + vi paging
   # (Ctrl-U/Ctrl-D half page, Ctrl-B/Ctrl-F full page) in copy-mode.
   # `mouse on` is tmux >= 2.1; fall back to the pre-2.1 mode-* options so very old
@@ -1010,11 +1115,21 @@ cmd_setup(){
     tmux bind-key -T copy-mode-vi y send-keys -X copy-selection-and-cancel 2>/dev/null || true
     tmux bind-key -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel 2>/dev/null || true
   fi
-  tmux bind-key -n WheelUpPane if-shell -F '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e; send-keys -M' 2>/dev/null || true
+  # Wheel over ANY pane (focused or not) must scroll THAT pane: every command
+  # targets the pane under the mouse (-t=). Mouse-aware TUIs (claude/codex
+  # report mouse -> mouse_any_flag) get the wheel events natively so their own
+  # viewport scrolls; other panes enter tmux copy-mode and scroll the history.
+  # (The old binding forced copy-mode even over mouse-aware TUIs, and on older
+  # tmux could scroll the ACTIVE pane instead of the hovered one.)
+  tmux bind-key -n WheelUpPane "if-shell -Ft= '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' 'copy-mode -e -t= ; send-keys -M'" 2>/dev/null || true
+  # Click on an inactive pane focuses it AND forwards the click to the app there
+  # (tmux's default; re-bound explicitly so a user config override can't break
+  # click-to-focus in the grid).
+  tmux bind-key -n MouseDown1Pane 'select-pane -t= ; send-keys -M' 2>/dev/null || true
   # Keep lots of scrollback so `wtcp score` can feed the judge each agent's whole
   # session (set before the agent panes are created, so they inherit it).
   tmux set -g history-limit 100000
-  echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-R review menu"
+  echo "wtcp: keybindings -> prefix, then  Ctrl-P pick  ·  Ctrl-K keep  ·  Ctrl-X drop  ·  Ctrl-S send-all  ·  Ctrl-F fork  ·  Ctrl-R review menu"
   echo "  Use Ctrl + the letter (works with the Korean IME). Ctrl-R lets you run the judge, show details, or copy the report."
   echo "  Move/resize: prefix+arrow = move (o = cycle) · prefix+z = fullscreen one (z to return) · prefix+Ctrl-arrow = resize."
   echo "  Scroll/copy: mouse wheel, or prefix+[ then Ctrl-U/Ctrl-D; y/Enter copies selection when a clipboard tool exists."
@@ -1060,9 +1175,16 @@ cmd_doctor(){
   printf '  agents           %s\n' "$COCKPIT_AGENTS"
   local a p cmd kind
   for a in $COCKPIT_AGENTS; do
-    cmd=$(_agent_cmd "$a"); kind=$(_agent_kind "$a")
-    if [ -n "$cmd" ]; then
-      printf '    %-14s custom cmd (%s)\n' "$a" "$kind"
+    kind=$(_agent_kind "$a")
+    if [ -n "$(_agent_cmd "$a")" ]; then
+      printf '    %-14s custom cmd (%s): %s\n' "$a" "$kind" "$(_agent_cmd "$a")"
+      continue
+    fi
+    cmd=$(_agent_launch_cmd "$a")
+    if [ -n "$cmd" ]; then   # derived (trust flags and/or COCKPIT_AGENT_<ALIAS>_MODEL)
+      p=$(command -v "${cmd%% *}" 2>/dev/null || true)
+      printf '    %-14s %s%s\n' "$a" "$cmd" "${p:+   (${p})}"
+      [ -n "$p" ] || printf '    %-14s ^ CLI %s not on PATH\n' "" "${cmd%% *}"
       continue
     fi
     p=$(command -v "$a" 2>/dev/null || true)
@@ -1107,7 +1229,10 @@ case "${1:-}" in
   start|broadcast|b) shift; cmd_broadcast "$@";;
   send|s)            shift; cmd_send "$@";;
   prompt-send)       shift; cmd_prompt_send "$@";;
+  prompt-fork)       shift; cmd_prompt_fork "$@";;
   pick|p)            shift; cmd_pick "$@";;
+  keep|k)            shift; cmd_keep "$@";;
+  keep-menu)         shift; cmd_keep_menu "$@";;
   fork|f)            shift; cmd_fork "$@";;
   drop|x)            shift; cmd_drop "$@";;
   abandon|a)         shift; cmd_abandon "$@";;

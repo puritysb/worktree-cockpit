@@ -5,16 +5,23 @@
 # claude codex opencode gemini. Others (e.g. agy) are auto-configured by wtcp.
 COCKPIT_AGENTS="claude codex opencode"
 
-# To compare the same CLI with different models/backends, give each variant a
-# unique agent alias and map it to a command. Alias names become branch suffixes,
-# so keep them shell/git friendly: letters, numbers, dash, underscore.
-# Example:
-# COCKPIT_AGENTS="claude-sonnet claude-mlx codex-gpt5 codex-mlx"
-# COCKPIT_AGENT_CLAUDE_SONNET_CMD="claude --model sonnet"
-# COCKPIT_AGENT_CLAUDE_MLX_CMD="claude --model mlx"
-# COCKPIT_AGENT_CODEX_GPT5_CMD="codex --model gpt-5"
-# COCKPIT_AGENT_CODEX_MLX_CMD="codex --model mlx"
-# If the alias does not start with claude/codex/agy, set its kind for trust setup:
+# To compare the same CLI with different MODELS, give each variant a unique
+# alias and set its model — wtcp launches the alias kind's CLI with --model.
+# Alias names become branch suffixes, so keep them shell/git friendly.
+# Example (claude vs claude, different models):
+# COCKPIT_AGENTS="claude-fable claude-opus codex-gpt5"
+# COCKPIT_AGENT_CLAUDE_FABLE_MODEL="fable"
+# COCKPIT_AGENT_CLAUDE_OPUS_MODEL="opus"
+# COCKPIT_AGENT_CODEX_GPT5_MODEL="gpt-5"
+#
+# For a different BACKEND / env vars / extra flags, map the alias to a full
+# command instead (wins over _MODEL). E.g. Claude Code on Zhipu's GLM endpoint
+# (any Anthropic-compatible API works the same way):
+# COCKPIT_AGENTS="claude-fable claude-glm"
+# COCKPIT_AGENT_CLAUDE_GLM_CMD="env ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-... ANTHROPIC_MODEL=glm-4.6 claude"
+#
+# If the alias does not start with claude/codex/agy, set its kind (trust setup +
+# the CLI that _MODEL launches):
 # COCKPIT_AGENT_MY_ALIAS_KIND="codex"
 
 # Agents that workmux can't prompt-inject: wtcp types the prompt into their pane
