@@ -33,13 +33,22 @@ This file is the design/gotcha memory for working ON wtcp itself.
   via `$INVOKE <verb>` (INVOKE resolves to `wtcp` on PATH).
 - `cmd_score` does **comparative** judging (all agents in one LLM call → rank +
   winner), falling back to independent per-agent scoring (`_score_independent`).
-- `prefix Ctrl-R` opens a `display-menu` (run judge / pick-winner / show / copy).
-  After scoring — and via `wtcp winner` / the menu's "pick winner" — `_winner_menu`
-  reads the ★scores stamped on each pane border, ranks best-first, and a selection
+- `prefix Ctrl-R` opens a `display-menu` (run judge / pick-winner / view-diff /
+  show / copy). After scoring — and via `wtcp winner` / the menu's "pick winner" —
+  `_winner_menu` reads the ★scores stamped on each pane border (via `_scored_rows`:
+  unjudged `★ ?` panes get sort key −1 so they land LAST — `?` is text and would
+  otherwise sort above numbers under `sort -rn`), ranks best-first, and a selection
   runs `wtcp pick <worktree>`. `cmd_pick` therefore takes an OPTIONAL worktree arg
   (the menu passes it); with no arg it uses the focused pane. Losers are found by
   worktree name, not pane focus, so an explicit winner still drops the rest.
-  `_winner_menu`/`display-menu` no-op without an attached client (headless tests).
+  Menus (`_agent_menu`) /`display-menu` no-op without an attached client (headless tests).
+- `wtcp diff [wt]` shows an agent's FULL diff vs `@cockpit_base` in a popup
+  (`_show_diff_popup`): the judge reads a capped diff (`_wt_diff` = `_wt_diff_raw`
+  piped through `head -c $COCKPIT_JUDGE_DIFF_CHARS`), the viewer reads the uncapped
+  `_wt_diff_raw`. Renders via `delta` when on PATH (force `DELTA_PAGER='less -R'` —
+  delta's default pager includes `-F`, the popup flash-close gotcha) else
+  `git diff --color=always` + `less -R`. Writes `~/.config/wtcp/diff.txt` even
+  headless (the test observable).
 - `cmd_pick` skips `workmux merge` when the winner has NO changes vs `@cockpit_base`
   (analysis/research round) and just cleans up — `workmux merge` errors on an
   empty branch. `_show_judge_report` opens the report popup WITHOUT less's `-F`
@@ -70,7 +79,8 @@ This file is the design/gotcha memory for working ON wtcp itself.
    `--dangerously-bypass-approvals-and-sandbox` (codex) auto-approve *tool use* but do
    NOT skip the "Do you trust this folder?" dialog. That dialog is skipped by
    pre-seeding each agent's own trust store (`_pretrust`, gated on `COCKPIT_TRUST=1`):
-   - claude → `~/.claude.json` `projects[<worktree>].hasTrustDialogAccepted=true` (jq, atomic)
+   - claude → `~/.claude.json` `projects[<worktree>].hasTrustDialogAccepted=true`
+     + `hasTrustDialogBashAccepted=true` (jq, atomic)
    - codex → `~/.codex/config.toml` `[projects."<repo-root>"] trust_level="trusted"` (codex scopes to repo root)
    - agy → manual; its store is under `~/.gemini` (shared with the Google OAuth token — do NOT touch)
    Under `COCKPIT_TRUST=1`, claude launches `--permission-mode auto` (NOT bypass; per user preference);
@@ -123,7 +133,9 @@ Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_MODEL`
 Judge: `COCKPIT_JUDGE_URL`, `COCKPIT_JUDGE_AUTH` (Authorization header for hosted
 endpoints; namer reuses it by default via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_MODEL`,
 `COCKPIT_JUDGE_OUTPUT_CHARS`, `COCKPIT_JUDGE_DIFF_CHARS`, `COCKPIT_JUDGE_COMPARE_CHARS`,
-`COCKPIT_JUDGE_TIMEOUT`, `COCKPIT_POPUP_WIDTH`, `COCKPIT_POPUP_HEIGHT`.
+`COCKPIT_JUDGE_TIMEOUT`, `COCKPIT_POPUP_WIDTH`, `COCKPIT_POPUP_HEIGHT`,
+`COCKPIT_NO_INTERACTIVE_MENUS` (1 = never auto-open the winner menu after
+scoring; headless/tests).
 Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path).
 
 ## Testing wtcp without real agents

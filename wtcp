@@ -8,6 +8,7 @@
 #   wtcp show                                                 show the last judge report popup
 #   wtcp copy                           cp                    copy the last judge report to the clipboard
 #   wtcp winner                                 prefix Ctrl-R menu: pick the winning agent (best score first) -> merge it
+#   wtcp diff [name]                            prefix Ctrl-R view an agent's FULL diff vs the round base (focused pane, or menu)
 #   wtcp pick                           p       prefix Ctrl-P merge the FOCUSED agent into the workmux main branch (auto-commit), drop the rest
 #   wtcp drop                           x       prefix Ctrl-X remove just the focused agent's pane (grid re-tiles)
 #   wtcp send "<text>"                  s       prefix Ctrl-S send a follow-up line to every agent
@@ -317,6 +318,34 @@ _apply_grid_layout(){
   tmux select-layout -t "$cwin" "${cs},${geo}" 2>/dev/null || tmux select-layout -t "$cwin" tiled 2>/dev/null || true
 }
 
+# Grid assembly timed out with agents missing. Don't auto-destroy what DID
+# launch: worktrees are created sequentially and slow project hooks routinely
+# outlive the timeout (gotcha #3), so the missing windows may be seconds away
+# and the launched agents may already be mid-work. Default to keeping.
+_launch_timeout_bail(){   # $1=task $2=found windows ("<win> <worktree>" lines) $3=expected $4=timeout_s
+  local task="$1" found="$2" nag="$3" timeout_s="$4" a
+  {
+    echo "wtcp: expected $nag worktree windows for '$task', found $(printf '%s\n' "$found" | grep -c . || true) after ${timeout_s}s:"
+    for a in $COCKPIT_AGENTS; do
+      if printf '%s\n' "$found" | grep -q " $task-$a\$"; then
+        echo "    $a: launched"
+      else
+        echo "    $a: MISSING"
+      fi
+    done
+    echo "wtcp: likely causes: agent CLI not installed/authenticated, a custom agent name missing"
+    echo "  from ~/.config/workmux/config.yaml, or slow worktree hooks (raise COCKPIT_LAUNCH_TIMEOUT)."
+    echo "  Run 'wtcp doctor' to check the environment."
+    printf "  [k] keep what launched (inspect/retry)  ·  [c] clean this round's worktrees now? [k/c] "
+  } >&2
+  local ans=""; read -r ans </dev/tty 2>/dev/null || ans=k   # headless -> keep (no work lost)
+  case "$ans" in
+    c|C) _clean_task "$task"; echo "wtcp: removed '$task-*' worktrees" >&2;;
+    *)   echo "wtcp: kept. Clean up later with 'wtcp clean', or retry once the missing agent is fixed." >&2;;
+  esac
+  die "round '$task' did not fully launch"
+}
+
 # One round: branch N agents from base + broadcast prompt + assemble grid.
 _run_round(){
   local prompt="$1" task="$2" base="${3:-}"
@@ -347,7 +376,7 @@ _run_round(){
     now=$(date +%s); [ "$now" -ge "$deadline" ] && break
     sleep 1
   done
-  [ "${found_count:-0}" -eq "$nag" ] || die "expected $nag worktree windows for '$task', found ${found_count:-0} after ${timeout_s}s — an agent likely failed to launch (check each of [$COCKPIT_AGENTS] is installed + authenticated, and custom names are defined in ~/.config/workmux/config.yaml; run 'wtcp doctor')"
+  [ "${found_count:-0}" -eq "$nag" ] || _launch_timeout_bail "$task" "$neww" "$nag" "$timeout_s"
 
   # Grid window: pull each agent pane in with join-pane (pane_id is stable across the move).
   local cwin ph
@@ -446,6 +475,12 @@ _find_task_windows(){   # $1 = task; prints "<window-id> <worktree>" in COCKPIT_
     done < <(tmux list-windows -F '#{window_id}')
     [ -n "$found" ] && printf '%s %s\n' "$found" "$want"
   done
+  # Must return 0 even when the LAST agent's window is missing: the `[ -n ] &&`
+  # above would otherwise be this function's exit status, and callers assign
+  # `neww=$(_find_task_windows ...)` under `set -e` — a non-zero status there
+  # killed `wtcp start` SILENTLY instead of reaching the launch-timeout path
+  # (same class of bug as _wt_path above).
+  return 0
 }
 # On collision, ask the user what to do. Sets global RESOLVED_TASK (or aborts).
 # Defaults to auto-rename when there's no TTY (non-interactive).
@@ -524,20 +559,28 @@ cmd_abandon(){
 # small enough to fit the judge's context. Raise for a bigger-context model.
 : "${COCKPIT_JUDGE_COMPARE_CHARS:=48000}"
 
-_wt_diff(){   # $1=worktree path $2=base ref -> diff vs base (tracked + untracked new files), capped
-  local path="$1" base="${2:-}" f
+_diff_base(){   # $1=worktree path $2=requested base -> validated base ref (fallback main/master)
+  local path="$1" base="${2:-}"
   if [ -n "$base" ] && ! git -C "$path" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1; then
     base=""
   fi
   if [ -z "$base" ]; then
     base=main; git -C "$path" rev-parse --verify -q main >/dev/null 2>&1 || base=master
   fi
-  {
-    git -C "$path" diff "$base" 2>/dev/null
-    while IFS= read -r -d '' f; do
-      printf '\n--- new file: %s ---\n' "$f"; git -C "$path" diff --no-index -- /dev/null "$path/$f" 2>/dev/null
-    done < <(git -C "$path" ls-files -z --others --exclude-standard 2>/dev/null)
-  } | head -c "$COCKPIT_JUDGE_DIFF_CHARS"
+  printf '%s' "$base"
+}
+_wt_diff_raw(){   # $1=worktree path $2=base ref $3=color(never|always) -> FULL diff vs base (tracked + untracked new files), uncapped
+  local path="$1" base f color="${3:-never}"
+  base=$(_diff_base "$path" "${2:-}")
+  git -C "$path" diff --color="$color" "$base" 2>/dev/null || true
+  while IFS= read -r -d '' f; do
+    printf '\n--- new file: %s ---\n' "$f"
+    # --no-index exits 1 when the files differ (always, here) — not an error.
+    git -C "$path" diff --no-index --color="$color" -- /dev/null "$path/$f" 2>/dev/null || true
+  done < <(git -C "$path" ls-files -z --others --exclude-standard 2>/dev/null)
+}
+_wt_diff(){   # judge evidence: plain diff capped to the judge's budget
+  _wt_diff_raw "$1" "${2:-}" never | head -c "$COCKPIT_JUDGE_DIFF_CHARS"
 }
 
 _judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason|model"
@@ -561,6 +604,38 @@ _judge_one(){   # $1=path $2=task prompt $3=pane_id $4=base ref -> "score|reason
 }
 
 _judge_file(){ printf '%s' "$HOME/.config/wtcp/judge.txt"; }
+_diff_file(){ printf '%s' "$HOME/.config/wtcp/diff.txt"; }
+# Full-diff popup for one agent worktree: the judge only sees a capped diff,
+# the user gets the WHOLE thing. Renders through delta when on PATH (it
+# colorizes plain diff itself), else colorized git diff + less.
+_show_diff_popup(){   # $1=worktree name
+  local wt="$1" path base F qF body pager color
+  path=$(_wt_path "$wt")
+  if [ -z "$path" ]; then
+    tmux display-message "wtcp: no worktree path for [$wt]" 2>/dev/null || true
+    echo "wtcp: no worktree path for [$wt]" >&2; return 1
+  fi
+  base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
+  if command -v delta >/dev/null 2>&1; then
+    # Force delta's pager to plain `less -R`: its default includes -F, which
+    # would flash the popup shut on a one-screen diff (same gotcha as
+    # _show_judge_report). delta wants an UNcolored diff on stdin.
+    color=never; pager="DELTA_PAGER='less -R' delta <"
+  else
+    color=always; pager="LESS='-R' ${PAGER:-less}"
+  fi
+  body=$(_wt_diff_raw "$path" "$base" "$color")
+  if [ -z "$body" ]; then
+    tmux display-message "wtcp: [$wt] has no changes vs ${base:-main}" 2>/dev/null || true
+    echo "wtcp: [$wt] has no changes vs ${base:-main}"
+    return 0
+  fi
+  F=$(_diff_file); mkdir -p "$(dirname "$F")"
+  printf '=== %s — diff vs %s ===\n\n%s\n' "$wt" "$(_diff_base "$path" "$base")" "$body" > "$F"
+  qF=$(_sh_quote "$F")
+  # NOTE: no -F on the pager (see _show_judge_report).
+  tmux display-popup -E -w "$COCKPIT_POPUP_WIDTH" -h "$COCKPIT_POPUP_HEIGHT" "$pager $qF" 2>/dev/null || true
+}
 _show_judge_report(){
   local F="${1:-$(_judge_file)}" qF
   [ -s "$F" ] || { tmux display-message "wtcp: no judge report yet" 2>/dev/null || true; return 1; }
@@ -569,31 +644,43 @@ _show_judge_report(){
   # which would make the popup flash and close. Keep it open until the user hits q.
   tmux display-popup -E -w "$COCKPIT_POPUP_WIDTH" -h "$COCKPIT_POPUP_HEIGHT" "LESS='-R' ${PAGER:-less} $qF" 2>/dev/null || true
 }
-# Build an interactive "pick the winner to merge" menu from the live grid's scored
-# pane borders (best score first). Selecting an agent runs `wtcp pick <worktree>`.
-# No-ops when no client is attached (e.g. headless tests) or nothing is scored.
-_winner_menu(){
-  local cwin="$1" sess
-  sess=$(tmux display -p -t "$cwin" '#{session_id}' 2>/dev/null || true)
-  [ -n "$sess" ] && tmux list-clients -t "$sess" 2>/dev/null | grep -q . || return 0
-  local p wt label sc rows=()
+# Collect "score<TAB>worktree" rows from the grid's scored pane borders, best
+# score first. Unjudged panes (★ ?) get sort key -1 so they land LAST — '?' is
+# text and would otherwise sort ABOVE the numbers under `sort -rn`. Name
+# tie-break keeps the order deterministic among equal scores / multiple '?'.
+_scored_rows(){   # $1=grid window id
+  local cwin="$1" p wt label sc key rows=()
   while IFS= read -r p; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
     label=$(tmux show-options -pqv -t "$p" @pane_label 2>/dev/null || true)
     case "$label" in *"★ "*) sc="${label##*★ }"; sc="${sc%% *}";; *) sc="";; esac
     case "$sc" in ''|*[!0-9.]*) sc="?";; esac
-    rows+=("$sc"$'\t'"$wt")
+    key="$sc"; [ "$sc" = "?" ] && key="-1"
+    rows+=("$key"$'\t'"$sc"$'\t'"$wt")
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
   [ "${#rows[@]}" -gt 0 ] || return 0
-  local items=() s n idx=0 key qn
+  printf '%s\n' "${rows[@]}" | sort -t"$(printf '\t')" -k1,1rn -k3,3 | cut -f2-
+}
+# Interactive menu over the grid's agents (best score first); selecting one runs
+# `wtcp <verb> <worktree>`. No-ops when no client is attached (headless tests)
+# or the grid has no agent panes.
+_agent_menu(){   # $1=grid window $2=menu title $3=verb (pick|diff)
+  local cwin="$1" title="$2" verb="$3" sess
+  sess=$(tmux display -p -t "$cwin" '#{session_id}' 2>/dev/null || true)
+  [ -n "$sess" ] && tmux list-clients -t "$sess" 2>/dev/null | grep -q . || return 0
+  local items=() s n idx=0 key qn lbl
   while IFS=$'\t' read -r s n; do
     idx=$((idx+1)); key="$idx"; [ "$idx" -gt 9 ] && key=""
     qn=$(_sh_quote "$n")
-    items+=("★ ${s}  ${n}" "$key" "run-shell \"$INVOKE_CMD pick $qn\"")
-  done < <(printf '%s\n' "${rows[@]}" | sort -t"$(printf '\t')" -k1,1 -rn)
+    lbl="★ ${s}  ${n}"; [ "$s" = "?" ] && lbl="★ ?  ${n}  (unjudged)"
+    items+=("$lbl" "$key" "run-shell \"$INVOKE_CMD $verb $qn\"")
+  done < <(_scored_rows "$cwin")
+  [ "${#items[@]}" -gt 0 ] || return 0
   items+=("" "" "" "Cancel" q "")
-  tmux display-menu -T "wtcp — pick winner to merge" "${items[@]}" 2>/dev/null || true
+  tmux display-menu -T "$title" "${items[@]}" 2>/dev/null || true
 }
+_winner_menu(){ _agent_menu "$1" "wtcp — pick winner to merge" pick; }
+_diff_menu(){   _agent_menu "$1" "wtcp — view agent diff" diff; }
 
 # Fallback: judge each agent independently (used if comparative parsing fails).
 _score_independent(){
@@ -761,6 +848,18 @@ cmd_winner(){
   _winner_menu "$cwin"
 }
 
+# Full-diff viewer. Worktree from $1 when given (the diff menu passes it),
+# else the focused agent pane; from the bar/empty pane, open the agent menu.
+cmd_diff(){
+  need_tmux
+  local wt="${1:-}"
+  if [ -z "$wt" ]; then
+    wt=$(pane_wt "$(tmux display -p '#{pane_id}')")
+    if [ -z "$wt" ]; then _diff_menu "$(tmux display -p '#{window_id}')"; return 0; fi
+  fi
+  _show_diff_popup "$wt"
+}
+
 _copy_to_clipboard(){
   local F="$1"
   if command -v pbcopy >/dev/null 2>&1; then pbcopy < "$F"; return 0; fi
@@ -779,6 +878,36 @@ cmd_copy(){
     cat "$F"
     die "no clipboard command found (need pbcopy, wl-copy, or xclip)"
   fi
+}
+
+# workmux merge failed (usually a conflict). Nothing has been removed at this
+# point — keep the whole round alive and tell the user how to recover. Depending
+# on workmux version/strategy the conflict lands mid-merge in the MAIN worktree,
+# mid-rebase in the winner's worktree, or (current workmux) nowhere — it keeps
+# the target clean and asks you to rebase the winner's worktree onto the base
+# yourself. Detect which and tailor the guidance.
+_merge_fail_recover(){   # $1=winner worktree
+  local winner="$1" root wpath
+  root=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true)
+  wpath=$(_wm path "$winner" 2>/dev/null || true)
+  # pick usually runs from a keybinding run-shell where stderr is easy to miss.
+  tmux display-message "wtcp: merge of [$winner] FAILED — round kept intact (see output)" 2>/dev/null || true
+  {
+    echo "wtcp: merge of [$winner] failed. NOTHING was removed — all agent worktrees and the grid are intact."
+    if [ -n "$root" ] && git -C "$root" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+      echo "wtcp: the conflict is mid-merge in the MAIN worktree ($root). Either:"
+      echo "  - resolve there, 'git add -A && git commit', then run 'wtcp abandon' from the grid"
+      echo "    (the merge commit is now on the main branch; abandon just drops the round worktrees), or"
+      echo "  - back out with 'git -C $root merge --abort', then pick another agent or fix + re-run 'wtcp pick $winner'."
+    elif [ -n "$wpath" ] && [ -d "$(git -C "$wpath" rev-parse --git-path rebase-merge 2>/dev/null)" ]; then
+      echo "wtcp: the conflict is mid-rebase in the winner's worktree ($wpath)."
+      echo "  Resolve there, 'git rebase --continue', then re-run 'wtcp pick $winner'."
+    else
+      echo "wtcp: workmux kept the target clean (see its output above). Update the winner's worktree onto the base"
+      [ -n "$wpath" ] && echo "  (e.g. 'git -C $wpath rebase <main-branch>'), resolve any conflicts there,"
+      echo "  then re-run 'wtcp pick $winner' — or pick another agent, or 'wtcp abandon'."
+    fi
+  } >&2
 }
 
 cmd_pick(){
@@ -815,7 +944,7 @@ cmd_pick(){
   echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
   local did_merge=0
   if [ "$has_changes" -eq 1 ]; then
-    _wm merge "$winner" || die "merge failed (resolve conflicts)"
+    _wm merge "$winner" || { _merge_fail_recover "$winner"; exit 1; }
     did_merge=1
   else
     echo "wtcp: winner has no code changes vs base; skipping workmux merge."
@@ -852,6 +981,7 @@ cmd_setup(){
     tmux bind-key "$k" display-menu -T "wtcp review" \
       "Run LLM judge (score all)" r "run-shell \"$INVOKE_CMD score\"" \
       "Pick winner to merge" p "run-shell \"$INVOKE_CMD winner\"" \
+      "View agent diff" d "run-shell \"$INVOKE_CMD diff\"" \
       "Show last result" v "run-shell \"$INVOKE_CMD show\"" \
       "Copy last result" c "run-shell \"$INVOKE_CMD copy\"" \
       "" "" "" \
@@ -984,6 +1114,7 @@ case "${1:-}" in
   grid|g)            shift; cmd_grid "$@";;
   score|r)           shift; cmd_score "$@";;
   winner)            shift; cmd_winner "$@";;
+  diff)              shift; cmd_diff "$@";;
   show)              shift; cmd_show "$@";;
   copy|cp)           shift; cmd_copy "$@";;
   agents)            shift; cmd_agents "$@";;

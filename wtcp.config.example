@@ -17,6 +17,14 @@ COCKPIT_AGENTS="claude codex opencode"
 # If the alias does not start with claude/codex/agy, set its kind for trust setup:
 # COCKPIT_AGENT_MY_ALIAS_KIND="codex"
 
+# Agents that workmux can't prompt-inject: wtcp types the prompt into their pane
+# via tmux send-keys instead. Empty by default (agy launches via a wrapper that
+# loads the prompt itself). SEND_DELAY is the pause between paste and Enter
+# (avoids the codex submit race); AGY_DELAY the wait before send-keys delivery.
+# COCKPIT_SENDKEYS_AGENTS=""
+# COCKPIT_SEND_DELAY=0.4
+# COCKPIT_AGY_DELAY=4
+
 # LLM judge endpoint used by `wtcp score`.
 # Set this to any OpenAI-compatible /chat/completions URL you actually run.
 # Examples:
@@ -57,6 +65,14 @@ COCKPIT_NAMER="fm"
 # Override only when branch naming should use a different endpoint/model.
 COCKPIT_NAMER_URL=""
 COCKPIT_NAMER_MODEL=""
+# COCKPIT_NAMER_AUTH=""
+# Path to the on-device FM helper binary (default: assets/fm-helper/wtcp-fm-helper
+# next to the wtcp script; install.sh builds it on macOS).
+# COCKPIT_FM_HELPER=""
+# Optional warm Apple-Intelligence endpoint (AgentDeck daemon). Port defaults to
+# ~/.agentdeck/daemon.json httpPort, then 9120; URL to http://127.0.0.1:<port>.
+# COCKPIT_DAEMON_PORT=""
+# COCKPIT_DAEMON_URL=""
 
 # OPT-IN. 1 = auto-start brand-new projects: pre-seed each agent's folder-trust
 # store (so "Do you trust this folder?" is skipped) AND launch in an unattended
@@ -66,3 +82,10 @@ COCKPIT_TRUST=0
 # Override how claude/codex launch under COCKPIT_TRUST=1 (defaults shown):
 # COCKPIT_CLAUDE_CMD="claude --permission-mode auto"
 # COCKPIT_CODEX_CMD="codex --dangerously-bypass-approvals-and-sandbox"
+
+# 1 = never auto-open the winner menu after scoring (headless runs / tests).
+# COCKPIT_NO_INTERACTIVE_MENUS=0
+
+# Command prefix the in-grid keybindings call back through (default: `wtcp` on
+# PATH, else this script's absolute path). Set for wrappers, e.g.:
+# COCKPIT_INVOKE="env WTCP_CONFIG=$HOME/.config/wtcp/config /path/to/wtcp"

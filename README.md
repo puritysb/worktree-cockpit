@@ -72,10 +72,11 @@ wtcp start "add a CONTRIBUTING.md"
 ```
 
 Once the grid opens, review the panes. If a judge endpoint is configured, use
-`prefix Ctrl-R` to open the review menu: run the LLM judge, show the detailed
-report, copy the last result, or **pick the winner to merge** (a menu of the
-scored agents, best first — choosing one merges it directly). You can also focus
-any pane and use `prefix Ctrl-P` to pick it yourself.
+`prefix Ctrl-R` to open the review menu: run the LLM judge, **view any agent's
+full diff**, show the detailed report, copy the last result, or **pick the
+winner to merge** (a menu of the scored agents, best first — choosing one merges
+it directly). You can also focus any pane and use `prefix Ctrl-P` to pick it
+yourself.
 
 ## LLM endpoint
 
@@ -119,16 +120,18 @@ The grid installs its keybindings automatically. In the grid, with your tmux
 | `Ctrl-P` | **pick** focused pane as winner → auto-commit + merge into the workmux main branch, drop the rest |
 | `Ctrl-X` | **drop** just the focused pane (grid re-tiles) |
 | `Ctrl-S` | **send** a follow-up instruction to *every* agent |
-| `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, show the detailed report, or copy the last result |
+| `Ctrl-R` | **review menu**: run the judge LLM, pick the winner to merge, view an agent's full diff, show the detailed report, or copy the last result |
 | `z` | fullscreen the focused agent (again to return) · arrows move between agents |
 | `[` | scroll/copy a pane (mouse wheel scrolls; drag to select copies to the clipboard; `Ctrl-U`/`Ctrl-D` page, `y`/`Enter` copy, `q` exits) |
 
 Use **Ctrl + the letter** — the Ctrl variants pass through the Korean IME.
 
 Other commands: `wtcp send "..."`, `wtcp fork "..."` (new round from a pane's
-WIP), `wtcp winner` (menu to pick the scored winner and merge it), `wtcp show`
-(last judge report), `wtcp copy` (copy last judge report),
-`wtcp abandon` (discard the current grid without merging), `wtcp grid`,
+WIP), `wtcp winner` (menu to pick the scored winner and merge it),
+`wtcp diff [name]` (an agent's **full** diff vs the round base in a popup — the
+focused pane's agent, or a menu; rendered with [delta](https://github.com/dandavison/delta)
+when installed), `wtcp show` (last judge report), `wtcp copy` (copy last judge
+report), `wtcp abandon` (discard the current grid without merging), `wtcp grid`,
 `wtcp list`, `wtcp clean`, `wtcp doctor` (environment check). Run `wtcp help`
 for the full list.
 
@@ -166,10 +169,19 @@ mouse-reporting state stale — detaching re-initializes it. Also check:
   back to it automatically, but upgrading tmux is better.
 
 **The grid doesn't build / panes are missing** — usually an agent failed to
-launch. `wtcp start` now aborts with which agent count it expected vs. found.
-Make sure every name in `COCKPIT_AGENTS` is an installed, **authenticated** CLI
-(and, for custom agents, defined in `~/.config/workmux/config.yaml`). A too-small
-terminal window can also fail joins ("pane too small") — make the window bigger.
+launch. On timeout `wtcp start` prints a per-agent launched/MISSING table and
+asks whether to **keep** what did launch (default — slow worktree hooks may just
+need more time; raise `COCKPIT_LAUNCH_TIMEOUT`) or **clean** the round's
+worktrees. Make sure every name in `COCKPIT_AGENTS` is an installed,
+**authenticated** CLI (and, for custom agents, defined in
+`~/.config/workmux/config.yaml`). A too-small terminal window can also fail
+joins ("pane too small") — make the window bigger.
+
+**A merge conflict during `wtcp pick`** keeps the whole round intact — nothing
+is removed. wtcp detects where the conflict landed (mid-merge in the main
+worktree, mid-rebase in the winner's worktree, or — with current workmux —
+nowhere, with a prompt to rebase the winner's worktree onto the base) and prints
+the matching resolve/retry steps.
 
 ## How scoring works
 
@@ -236,6 +248,7 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_POPUP_WIDTH` / `COCKPIT_POPUP_HEIGHT` | `92%` / `85%` | tmux popup size for judge details |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
 | `COCKPIT_NAMER_URL` / `COCKPIT_NAMER_MODEL` | judge settings | optional separate endpoint/model for branch naming |
+| `COCKPIT_NO_INTERACTIVE_MENUS` | `0` | `1` = never auto-open the winner menu after scoring (headless runs) |
 | `COCKPIT_TRUST` | `0` | **opt-in**: skip the per-agent folder-trust dialog + auto-approve tool use so new projects auto-start (edits the agents' trust stores + global workmux config) |
 | `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD` | _(see below)_ | override how claude/codex launch under `COCKPIT_TRUST` |
 | `COCKPIT_AGENT_<ALIAS>_CMD` | _(empty)_ | command used for a custom/variant agent alias |
