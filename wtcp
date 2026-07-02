@@ -77,7 +77,21 @@ fi
 _wm(){ command workmux "$@" </dev/null; }
 need_tmux(){ [ -n "${TMUX:-}" ] || die "run inside a tmux session"; }
 need_repo(){ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run inside a git repository"; }
-goto_root(){ local r; r=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true); [ -n "$r" ] && cd "$r" || true; }
+# Resolve the pane/window wtcp was INVOKED from. Prefer $TMUX_PANE (tmux sets
+# it for every process inside a pane): with NO attached client (headless or
+# scripted use), bare `tmux display -p` can resolve to a DIFFERENT pane/window
+# than the caller's — pick/keep/abandon would then act on the wrong window.
+# Keybindings (run-shell) and popups don't set TMUX_PANE; there an attached
+# client exists, so the `display -p` fallback correctly gives the active pane.
+_cur_pane(){
+  if [ -n "${TMUX_PANE:-}" ] && tmux display -p -t "$TMUX_PANE" '#{pane_id}' 2>/dev/null; then return 0; fi
+  tmux display -p '#{pane_id}'
+}
+_cur_win(){
+  if [ -n "${TMUX_PANE:-}" ] && tmux display -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null; then return 0; fi
+  tmux display -p '#{window_id}'
+}
+goto_root(){ local r; r=$(tmux show-options -wqv -t "$(_cur_win)" @cockpit_root 2>/dev/null || true); [ -n "$r" ] && cd "$r" || true; }
 pane_wt(){ tmux show-options -pqv -t "$1" @worktree 2>/dev/null || true; }
 # Type the prompt into a pane and submit it. codex leaves the text in the input
 # box if Enter arrives right after the paste, so we delay between the two
@@ -140,7 +154,7 @@ _agent_launch_cmd(){
 _wt_path(){
   local p root; p=$(_wm path "$1" 2>/dev/null || true)
   if [ -z "$p" ] || [ ! -d "$p" ]; then
-    root=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true)
+    root=$(tmux show-options -wqv -t "$(_cur_win)" @cockpit_root 2>/dev/null || true)
     [ -n "$root" ] && p="$(dirname "$root")/$(basename "$root")__worktrees/$1"
   fi
   # Must return 0 even when not found: callers use `path=$(_wt_path ...)` and a
@@ -539,7 +553,7 @@ cmd_broadcast(){
 cmd_fork(){
   need_tmux; need_repo
   local prompt="${1:-}"; [ -n "$prompt" ] || die 'fork "<prompt>" [name]'
-  local fp wt; fp=$(tmux display -p '#{pane_id}'); wt=$(pane_wt "$fp")
+  local fp wt; fp=$(_cur_pane); wt=$(pane_wt "$fp")
   [ -n "$wt" ] || die "put the cursor on the agent pane to fork from (not the bar/empty pane)"
   goto_root
   local wpath; wpath=$(_wm path "$wt" 2>/dev/null || true)
@@ -556,13 +570,18 @@ cmd_fork(){
 # Discard the current grid (review-only round, no merge). Removes worktrees + closes window.
 cmd_abandon(){
   need_tmux
-  local cwin; cwin=$(tmux display -p '#{window_id}')
+  local cwin; cwin=$(_cur_win)
   goto_root
   local p wt
   while IFS= read -r p; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] && (_wm remove "$wt" -f || true)
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
-  tmux kill-window -t "$cwin" 2>/dev/null || true
+  # Only kill a wtcp-owned (wt:*) window — abandoning from a plain shell
+  # window must not destroy that window.
+  case "$(tmux display -p -t "$cwin" '#{window_name}' 2>/dev/null)" in
+    "${WIN_PREFIX}:"*) tmux kill-window -t "$cwin" 2>/dev/null || true ;;
+    *) echo "wtcp: (not inside a wtcp grid window — nothing to close)" ;;
+  esac
   echo "wtcp: grid abandoned (nothing merged)."
 }
 
@@ -643,7 +662,7 @@ _show_diff_popup(){   # $1=worktree name
     tmux display-message "wtcp: no worktree path for [$wt]" 2>/dev/null || true
     echo "wtcp: no worktree path for [$wt]" >&2; return 1
   fi
-  base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
+  base=$(tmux show-options -wqv -t "$(_cur_win)" @cockpit_base 2>/dev/null || true)
   if command -v delta >/dev/null 2>&1; then
     # Force delta's pager to plain `less -R`: its default includes -F, which
     # would flash the popup shut on a one-screen diff (same gotcha as
@@ -738,9 +757,9 @@ cmd_score(){
     tmux display-message "wtcp: set COCKPIT_JUDGE_URL in ~/.config/wtcp/config to use scoring" 2>/dev/null || true
     die "set COCKPIT_JUDGE_URL in ~/.config/wtcp/config to use scoring"
   fi
-  local cwin prompt base; cwin=$(tmux display -p '#{window_id}')
-  prompt=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true)
-  base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
+  local cwin prompt base; cwin=$(_cur_win)
+  prompt=$(tmux show-options -wqv -t "$cwin" @cockpit_prompt 2>/dev/null || true)
+  base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
   tmux set-window-option -t "$cwin" pane-border-status top
   tmux set-window-option -t "$cwin" pane-border-format ' #{@pane_label} '
   # Collect agent panes (skip the bar/empty panes).
@@ -845,7 +864,7 @@ _send_to_window(){
 cmd_send(){
   need_tmux
   local text="${1:-}"; [ -n "$text" ] || die 'send "<text>"'
-  local cwin; cwin=$(tmux display -p '#{window_id}')
+  local cwin; cwin=$(_cur_win)
   _send_to_window "$cwin" "$text"
 }
 
@@ -853,7 +872,7 @@ cmd_prompt_send(){
   need_tmux
   local cwin="${1:-}" text
   if [ -z "$cwin" ] || ! tmux list-panes -t "$cwin" >/dev/null 2>&1; then
-    cwin=$(tmux display -p '#{window_id}')
+    cwin=$(_cur_win)
   fi
   if [ -t 0 ]; then
     printf 'send-all: ' > /dev/tty
@@ -889,7 +908,7 @@ cmd_show(){
 # Interactive winner picker for the current grid (menu of scored agents -> merge).
 cmd_winner(){
   need_tmux
-  local cwin; cwin=$(tmux display -p '#{window_id}')
+  local cwin; cwin=$(_cur_win)
   _winner_menu "$cwin"
 }
 
@@ -899,8 +918,8 @@ cmd_diff(){
   need_tmux
   local wt="${1:-}"
   if [ -z "$wt" ]; then
-    wt=$(pane_wt "$(tmux display -p '#{pane_id}')")
-    if [ -z "$wt" ]; then _diff_menu "$(tmux display -p '#{window_id}')"; return 0; fi
+    wt=$(pane_wt "$(_cur_pane)")
+    if [ -z "$wt" ]; then _diff_menu "$(_cur_win)"; return 0; fi
   fi
   _show_diff_popup "$wt"
 }
@@ -933,7 +952,7 @@ cmd_copy(){
 # yourself. Detect which and tailor the guidance.
 _merge_fail_recover(){   # $1=winner worktree
   local winner="$1" root wpath
-  root=$(tmux show-options -wqv @cockpit_root 2>/dev/null || true)
+  root=$(tmux show-options -wqv -t "$(_cur_win)" @cockpit_root 2>/dev/null || true)
   wpath=$(_wm path "$winner" 2>/dev/null || true)
   # pick usually runs from a keybinding run-shell where stderr is easy to miss.
   tmux display-message "wtcp: merge of [$winner] FAILED — round kept intact (see output)" 2>/dev/null || true
@@ -971,12 +990,23 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   [ -n "$kp" ] || die "no pane for [$keep] in this grid"
   # Carry the round context onto the kept pane's new window so goto_root, diff,
   # and fork keep working from it (window options don't survive break-pane).
-  local root prompt base nwin
+  local root prompt base nwin pcount
   root=$(tmux show-options -wqv -t "$cwin" @cockpit_root 2>/dev/null || true)
   prompt=$(tmux show-options -wqv -t "$cwin" @cockpit_prompt 2>/dev/null || true)
   base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
-  nwin=$(tmux break-pane -d -P -F '#{window_id}' -s "$kp" -n "${WIN_PREFIX}:${keep}") \
-    || die "could not break [$keep] out of the grid"
+  pcount=$(tmux list-panes -t "$cwin" -F x | grep -c . || true)
+  if [ "$pcount" -le 1 ]; then
+    # The window already holds ONLY the keeper (keep/pick pressed again in an
+    # already-kept window). break-pane can't split a single-pane window — on
+    # tmux >= 3.4 it "succeeds" with EMPTY -P output and just renames, which
+    # would leave nwin empty and later kill-window would destroy the live
+    # session. Keep the window in place instead.
+    nwin="$cwin"
+    tmux rename-window -t "$cwin" "${WIN_PREFIX}:${keep}" 2>/dev/null || true
+  else
+    nwin=$(tmux break-pane -d -P -F '#{window_id}' -s "$kp" -n "${WIN_PREFIX}:${keep}" 2>/dev/null) || nwin=""
+    [ -n "$nwin" ] || die "could not break [$keep] out of the grid"
+  fi
   [ -n "$root" ]   && tmux set-option -w -t "$nwin" @cockpit_root "$root"
   [ -n "$prompt" ] && tmux set-option -w -t "$nwin" @cockpit_prompt "$prompt"
   [ -n "$base" ]   && tmux set-option -w -t "$nwin" @cockpit_base "$base"
@@ -984,7 +1014,7 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   tmux set-window-option -t "$nwin" pane-border-format ' #{@pane_label} ' 2>/dev/null || true
   local l
   for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
-  tmux kill-window -t "$cwin" 2>/dev/null || true
+  [ "$nwin" = "$cwin" ] || tmux kill-window -t "$cwin" 2>/dev/null || true
   tmux select-window -t "$nwin" 2>/dev/null || true
   tmux display-message "wtcp: kept [$keep] — talk to it directly; prefix Ctrl-F forks a new round from it" 2>/dev/null || true
   echo "wtcp: kept [$keep] (worktree + live session, nothing merged). dropped: ${*:-(none)}"
@@ -992,16 +1022,16 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   echo "      multi-agent round from this agent's work; 'wtcp drop' discards it when done."
 }
 
-cmd_keep_menu(){ need_tmux; _keep_menu "$(tmux display -p '#{window_id}')"; }
+cmd_keep_menu(){ need_tmux; _keep_menu "$(_cur_win)"; }
 
 # Keep the focused agent (or $1 from the menu/CLI); from the bar pane, open a menu.
 cmd_keep(){
   need_tmux
-  local cwin keep; cwin=$(tmux display -p '#{window_id}')
+  local cwin keep; cwin=$(_cur_win)
   if [ -n "${1:-}" ]; then
     keep="$1"
   else
-    keep=$(pane_wt "$(tmux display -p '#{pane_id}')")
+    keep=$(pane_wt "$(_cur_pane)")
     if [ -z "$keep" ]; then _keep_menu "$cwin"; return 0; fi
   fi
   local losers=() p wt
@@ -1019,7 +1049,7 @@ cmd_pick(){
   need_tmux
   # Winner is $1 when given (e.g. the winner-pick menu passes the worktree name),
   # otherwise the focused pane's agent.
-  local cwin fp winner; cwin=$(tmux display -p '#{window_id}'); fp=$(tmux display -p '#{pane_id}')
+  local cwin fp winner; cwin=$(_cur_win); fp=$(_cur_pane)
   if [ -n "${1:-}" ]; then
     winner="$1"
   else
@@ -1035,12 +1065,12 @@ cmd_pick(){
   # Auto-commit the winner's uncommitted changes (workmux merge only takes commits -> else work is lost).
   local wpath base has_changes=1; wpath=$(_wm path "$winner" 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
-    local msg; msg=$(tmux show-options -wqv @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
+    local msg; msg=$(tmux show-options -wqv -t "$cwin" @cockpit_prompt 2>/dev/null || true); [ -n "$msg" ] || msg="wtcp pick: $winner"
     echo "wtcp: auto-committing the winner's uncommitted changes..."
     git -C "$wpath" add -A && git -C "$wpath" commit -q -m "$msg" \
       || die "auto-commit failed for [$winner]; merge aborted so the worktree is preserved"
   fi
-  base=$(tmux show-options -wqv @cockpit_base 2>/dev/null || true)
+  base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
   if [ -n "$wpath" ] && [ -n "$base" ] && git -C "$wpath" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1; then
     if git -C "$wpath" diff --quiet "$base" -- 2>/dev/null && [ -z "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
       has_changes=0
@@ -1057,13 +1087,17 @@ cmd_pick(){
   echo "wtcp: winner [$winner] -> merge to workmux main branch / cleanup: ${losers[*]:-(none)}"
   _wm merge "$winner" || { _merge_fail_recover "$winner"; exit 1; }
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
-  tmux kill-window -t "$cwin" 2>/dev/null || true
+  # Close the grid/kept window — but only a wtcp-owned (wt:*) window. `wtcp
+  # pick <name>` can be run from any shell window; that window must survive.
+  case "$(tmux display -p -t "$cwin" '#{window_name}' 2>/dev/null)" in
+    "${WIN_PREFIX}:"*) tmux kill-window -t "$cwin" 2>/dev/null || true ;;
+  esac
   echo "wtcp: done. merged winner — keep working or start another round."
 }
 
 cmd_drop(){
   need_tmux
-  local fp wt; fp=$(tmux display -p '#{pane_id}'); wt=$(pane_wt "$fp")
+  local fp wt; fp=$(_cur_pane); wt=$(pane_wt "$fp")
   [ -n "$wt" ] || die "put the cursor on the agent pane to drop (not the bar/empty pane)"
   goto_root
   echo "wtcp: dropping [$wt] (remove worktree + close pane, grid re-tiles)"
@@ -1215,7 +1249,7 @@ cmd_clean(){
   _wm remove --all -f
   # 2) Close any leftover grid windows (their joined panes aren't workmux-tracked
   #    so `remove` can't close them). Kill the window we're in LAST.
-  local w cur; cur=$(tmux display -p '#{window_id}' 2>/dev/null || true)
+  local w cur; cur=$(_cur_win 2>/dev/null || true)
   while IFS= read -r w; do
     [ -n "$w" ] && [ "$w" != "$cur" ] && tmux kill-window -t "$w" 2>/dev/null || true
   done < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')

@@ -130,6 +130,25 @@ This file is the design/gotcha memory for working ON wtcp itself.
    (tmux version, live mouse/mode-keys, nesting heuristic via `#{client_termname}`,
    agent CLIs on PATH, deps).
 
+11. **Unattached `tmux display -p '#{pane_id}'` can resolve to the WRONG pane.**
+   With no attached client (headless tests, agents driving tmux, scripts), the
+   bare "current pane/window" can resolve to a different window than the caller's
+   — observed: a command typed INTO a kept pane resolved `#{pane_id}` to another
+   window's pane, so `wtcp pick` there died and `wtcp abandon` would have killed
+   an unrelated window. ALL "which pane/window am I in" lookups go through
+   `_cur_pane`/`_cur_win`, which prefer `$TMUX_PANE` (set for every process
+   inside a pane) and fall back to `display -p` (correct when a client is
+   attached — keybindings' run-shell and popups don't set TMUX_PANE but always
+   have a client). Window-scoped `@cockpit_*` reads must pass `-t "$cwin"` /
+   `-t "$(_cur_win)"` for the same reason.
+12. **`break-pane` on a single-pane window "succeeds" but only renames (tmux ≥ 3.4).**
+   rc=0, EMPTY `-P` output, no new window. `_keep_session` must detect the
+   1-pane case (keep/pick re-run inside an already-kept window) and rename in
+   place instead — otherwise `nwin` is empty and the later `kill-window` on the
+   old window would destroy the live session. Related guard: `cmd_pick` /
+   `cmd_abandon` only `kill-window` windows whose name matches the `wt:` prefix,
+   so running them from a plain shell window can't destroy that window.
+
 ## Design decisions (evaluated & rejected — don't re-litigate)
 
 - **iTerm2-native split-view backend — rejected (2026-07).** iTerm2 can split panes
