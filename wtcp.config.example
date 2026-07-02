@@ -7,18 +7,21 @@ COCKPIT_AGENTS="claude codex opencode"
 
 # To compare the same CLI with different MODELS, give each variant a unique
 # alias and set its model — wtcp launches the alias kind's CLI with --model.
+# Works for any CLI that takes --model (claude, codex, opencode: provider/model).
 # Alias names become branch suffixes, so keep them shell/git friendly.
-# Example (claude vs claude, different models):
-# COCKPIT_AGENTS="claude-fable claude-opus codex-gpt5"
+# Example (same CLI, different models):
+# COCKPIT_AGENTS="claude-fable claude-opus codex-gpt5 opencode-glm"
 # COCKPIT_AGENT_CLAUDE_FABLE_MODEL="fable"
 # COCKPIT_AGENT_CLAUDE_OPUS_MODEL="opus"
 # COCKPIT_AGENT_CODEX_GPT5_MODEL="gpt-5"
+# COCKPIT_AGENT_OPENCODE_GLM_KIND="opencode"
+# COCKPIT_AGENT_OPENCODE_GLM_MODEL="zai-coding-plan/glm-5.2"
 #
 # For a different BACKEND / env vars / extra flags, map the alias to a full
 # command instead (wins over _MODEL). E.g. Claude Code on Zhipu's GLM endpoint
 # (any Anthropic-compatible API works the same way):
 # COCKPIT_AGENTS="claude-fable claude-glm"
-# COCKPIT_AGENT_CLAUDE_GLM_CMD="env ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-... ANTHROPIC_MODEL=glm-4.6 claude"
+# COCKPIT_AGENT_CLAUDE_GLM_CMD="env ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-... ANTHROPIC_MODEL=glm-5.2 claude"
 #
 # If the alias does not start with claude/codex/agy, set its kind (trust setup +
 # the CLI that _MODEL launches):

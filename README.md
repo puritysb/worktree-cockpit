@@ -270,9 +270,16 @@ COCKPIT_AGENT_CLAUDE_SONNET_MODEL="sonnet"
 
 `COCKPIT_AGENT_<ALIAS>_MODEL` accepts anything the CLI's `--model` flag accepts
 (an alias like `opus`, or a full model id). It works for any alias whose kind is
-a real CLI: `codex-gpt5` + `COCKPIT_AGENT_CODEX_GPT5_MODEL="gpt-5"` launches
-`codex --model gpt-5`. `wtcp doctor` prints the exact command each alias will
-launch.
+a real CLI that takes `--model` — codex and opencode switch models the same way:
+
+```sh
+COCKPIT_AGENT_CODEX_GPT5_MODEL="gpt-5"                      # -> codex --model gpt-5
+COCKPIT_AGENT_OPENCODE_GLM_KIND="opencode"
+COCKPIT_AGENT_OPENCODE_GLM_MODEL="zai-coding-plan/glm-5.2"  # -> opencode --model <provider>/<model>
+```
+
+(opencode takes `provider/model` — use the provider id from your opencode
+config.) `wtcp doctor` prints the exact command each alias will launch.
 
 For anything `--model` can't express — a different **backend** behind the same
 CLI, extra flags, env vars — set `COCKPIT_AGENT_<ALIAS>_CMD` with the full
@@ -281,13 +288,16 @@ Anthropic-compatible endpoint) to Claude Code** and race it against the stock
 models:
 
 ```sh
-COCKPIT_AGENTS="claude-fable claude-glm"
+COCKPIT_AGENTS="claude-fable claude-glm opencode-glm"
 COCKPIT_AGENT_CLAUDE_FABLE_MODEL="fable"
 # Claude Code CLI pointed at Zhipu's GLM endpoint (any Anthropic-compatible API works):
-COCKPIT_AGENT_CLAUDE_GLM_CMD="env ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-... ANTHROPIC_MODEL=glm-4.6 claude"
+COCKPIT_AGENT_CLAUDE_GLM_CMD="env ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-... ANTHROPIC_MODEL=glm-5.2 claude"
+# ...and the same model through opencode, for a same-model different-CLI race:
+COCKPIT_AGENT_OPENCODE_GLM_KIND="opencode"
+COCKPIT_AGENT_OPENCODE_GLM_MODEL="zai-coding-plan/glm-5.2"
 ```
 
-Both variants run side by side in the grid, get scored by the judge like any
+All variants run side by side in the grid, get scored by the judge like any
 other agents, and the winner merges the same way.
 
 Aliases starting with `claude-`, `codex-`, or `agy-` inherit the right
