@@ -21,6 +21,8 @@ This file is the design/gotcha memory for working ON wtcp itself.
   (`assets/fm-helper/wtcp-fm-helper`) is `.gitignore`d; `install.sh` builds it.
 - `install.sh` — symlinks `wtcp` to PATH, builds the FM helper, warns on missing deps.
 - `wtcp.config.example` → user copies to `~/.config/wtcp/config` (sourced shell vars).
+- `.agents/skills/session-end/SKILL.md` — repo-shared Codex session closeout /
+  handoff workflow, ported from Claude's `/session-end` command.
 
 ## Architecture (wtcp script)
 

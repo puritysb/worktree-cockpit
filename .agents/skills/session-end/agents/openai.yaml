@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session End"
+  short_description: "Review and close a coding session cleanly."
+  default_prompt: "Run a session-end review for the current repository."
