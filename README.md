@@ -246,10 +246,16 @@ the matching resolve/retry steps.
 
 `wtcp score` sends **all agents to the configured judge LLM in one call** so
 it compares them head-to-head: it scores each 0–10 with a reason relative to the
-others and names a winner. It evaluates both the diff vs the round base and the
-terminal output: the diff is the source of truth for implementation quality,
-while output is evidence for tests run, claims made, and analysis quality. Empty
-diffs are valid for analysis/review tasks and are not penalized by themselves.
+others and names a winner. The judge sees the full instruction timeline: the
+initial prompt plus any `wtcp send` / `Ctrl-S` follow-ups. Later follow-ups refine
+or supersede earlier instructions when they conflict, and every score reflects
+the agent's **current final state** at the moment you run `wtcp score`.
+
+It evaluates both the diff vs the round base and the terminal output. For code
+tasks, the diff is the source of truth for implementation quality, while output
+is evidence for tests run, claims made, and analysis quality. For analysis,
+review, debugging, planning, or research tasks with empty diffs, the terminal
+response is the primary evidence and an empty diff is not penalized by itself.
 The popup shows a short bullet report; each pane border gets its score. It falls
 back to independent per-agent scoring if the comparison can't be parsed.
 
@@ -259,13 +265,17 @@ runs the same pick machinery — merge when the winner has code changes, keep th
 session when it doesn't. The winner menu (`prefix Ctrl-R`) remains for choosing
 a different agent than the judge's pick.
 
-The judge sees as much context as fits its window — the full diff plus each
-agent's whole pane scrollback, budgeted by the `*_CHARS` vars below.
+You can score repeatedly during a multi-turn round. Previous scores are shown to
+the judge only as context for improvement/regression; the judge is instructed to
+grade the current evidence, not to preserve an earlier ranking. The judge sees as
+much context as fits its window — the instruction timeline, capped diff, and each
+agent's pane scrollback, budgeted by the `*_CHARS` vars below.
 
-The report writes each agent's **reason/summary in the same language as your
-prompt** (the judge mirrors the task's language; scores, names and the structural
-labels stay as-is), but the prompt explicitly tells the judge not to reward or
-penalize Korean vs English language choice unless your task requires a language.
+The report keeps structural labels in English, but writes each agent's
+**reason/summary content in the same language as your prompt**. Judge bullets are
+kept concise and include an `Improve:` bullet when points were deducted. The
+prompt explicitly tells the judge not to reward or penalize language choice
+unless your task requires a specific language.
 It also shows a `Judge model:` line naming the model the endpoint actually used.
 
 `wtcp copy` copies the last report from `~/.config/wtcp/judge.txt` to the system
@@ -277,6 +287,13 @@ clipboard (`pbcopy`, `wl-copy`, or `xclip`).
 become branch/worktree suffixes. To compare the **same CLI with different
 models**, give each variant an alias and set its model — wtcp launches the
 alias's base CLI with `--model`:
+
+Aliases are not inferred from their names. For example, `codex-glm` does not
+select GLM by itself; it must have a matching `COCKPIT_AGENT_CODEX_GLM_MODEL`,
+`COCKPIT_AGENT_CODEX_GLM_CMD`, or named profile in
+`~/.config/workmux/config.yaml`. If none is set, wtcp refuses the alias and tells
+you which profile names or model settings are available. It will not silently run
+`codex-glm` with the default Codex model.
 
 ```sh
 # claude vs claude: which model handles this prompt better?
@@ -292,12 +309,20 @@ a real CLI that takes `--model` — codex and opencode switch models the same wa
 
 ```sh
 COCKPIT_AGENT_CODEX_GPT5_MODEL="gpt-5"                      # -> codex --model gpt-5
-COCKPIT_AGENT_OPENCODE_GLM_KIND="opencode"
 COCKPIT_AGENT_OPENCODE_GLM_MODEL="zai-coding-plan/glm-5.2"  # -> opencode --model <provider>/<model>
 ```
 
 (opencode takes `provider/model` — use the provider id from your opencode
-config.) `wtcp doctor` prints the exact command each alias will launch.
+config.) `wtcp doctor` prints the exact command each alias will launch and the
+installed CLIs / workmux profiles detected on the current machine.
+
+When no model is set for a plain agent such as `claude` or `codex`, wtcp uses
+`COCKPIT_AGENT_<KIND>_DEFAULT_MODEL` or `COCKPIT_AGENT_DEFAULT_MODEL`. The
+built-in defaults are `claude=sonnet` and `codex=gpt-5`; opencode has no
+built-in default because its `provider/model` names are local to your opencode
+config. Aliases still require an explicit `_MODEL`, `_CMD`, or workmux profile
+so unsupported model combinations fail with guidance instead of launching the
+wrong model.
 
 For anything `--model` can't express — a different **backend** behind the same
 CLI, extra flags, env vars — set `COCKPIT_AGENT_<ALIAS>_CMD` with the full
@@ -342,19 +367,25 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_JUDGE_OUTPUT_CHARS` | `16000` | per-agent terminal-output budget sent to the judge |
 | `COCKPIT_JUDGE_DIFF_CHARS` | `16000` | per-agent diff budget |
 | `COCKPIT_JUDGE_COMPARE_CHARS` | `48000` | total evidence budget for comparative scoring (split across agents) |
+| `COCKPIT_PROMPT_LOG_CHARS` | `12000` | instruction timeline budget for initial prompt + follow-ups |
 | `COCKPIT_JUDGE_TIMEOUT` | `120` | seconds per judge request |
 | `COCKPIT_LAUNCH_TIMEOUT` | `0` | seconds to wait for agent windows; `0` auto-scales for slow cold worktree hooks |
 | `COCKPIT_STATUS` | `1` | live ⚡/💬 status on grid pane borders (`0` disables) |
 | `COCKPIT_STATUS_INTERVAL` / `COCKPIT_STATUS_IDLE` | `3` / `6` | status poll interval / seconds of quiet before 💬 |
 | `COCKPIT_POPUP_WIDTH` / `COCKPIT_POPUP_HEIGHT` | `92%` / `85%` | tmux popup size for judge details |
+| `COCKPIT_POPUP_DIM` / `COCKPIT_POPUP_DIM_STYLE` | `1` / `fg=colour244,bg=colour235` | dim pane styles behind popups; tmux has no true blur/backdrop |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
 | `COCKPIT_NAMER_URL` / `COCKPIT_NAMER_MODEL` | judge settings | optional separate endpoint/model for branch naming |
 | `COCKPIT_NO_INTERACTIVE_MENUS` | `0` | `1` = never auto-open the winner menu after scoring (headless runs) |
 | `COCKPIT_TRUST` | `0` | **opt-in**: skip the per-agent folder-trust dialog + auto-approve tool use so new projects auto-start (edits the agents' trust stores + global workmux config) |
 | `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD` | _(see below)_ | override how claude/codex launch under `COCKPIT_TRUST` |
+| `COCKPIT_AGENT_DEFAULT_MODEL` | _(empty)_ | fallback model for plain agents whose kind has no specific default |
+| `COCKPIT_AGENT_CLAUDE_DEFAULT_MODEL` | `sonnet` | default model for plain `claude` |
+| `COCKPIT_AGENT_CODEX_DEFAULT_MODEL` | `gpt-5` | default model for plain `codex` |
+| `COCKPIT_AGENT_OPENCODE_DEFAULT_MODEL` | _(empty)_ | optional opencode default, usually `provider/model` from your opencode config |
 | `COCKPIT_AGENT_<ALIAS>_CMD` | _(empty)_ | full command for a custom/variant agent alias (env vars, backends, extra flags; wins over `_MODEL`) |
 | `COCKPIT_AGENT_<ALIAS>_MODEL` | _(empty)_ | model for an alias: launches the alias kind's CLI with `--model <value>` |
-| `COCKPIT_AGENT_<ALIAS>_KIND` | inferred | base kind for alias trust handling and the CLI `_MODEL` launches (`claude`, `codex`, `agy`, etc.) |
+| `COCKPIT_AGENT_<ALIAS>_KIND` | inferred | base kind for alias trust handling and the CLI `_MODEL` launches (`claude`, `codex`, `opencode`, `agy`, etc.) |
 
 Raise the `*_CHARS` budgets for a bigger-context judge model; lower them for a
 small local one (char ≈ ⅓–¼ token, so keep the total under the model's window).
