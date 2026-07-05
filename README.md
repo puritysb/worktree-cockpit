@@ -318,11 +318,12 @@ installed CLIs / workmux profiles detected on the current machine.
 
 When no model is set for a plain agent such as `claude` or `codex`, wtcp uses
 `COCKPIT_AGENT_<KIND>_DEFAULT_MODEL` or `COCKPIT_AGENT_DEFAULT_MODEL`. The
-built-in defaults are `claude=sonnet` and `codex=gpt-5`; opencode has no
-built-in default because its `provider/model` names are local to your opencode
-config. Aliases still require an explicit `_MODEL`, `_CMD`, or workmux profile
-so unsupported model combinations fail with guidance instead of launching the
-wrong model.
+built-in default for `claude` is `sonnet`. For `codex`, wtcp reads the model
+from `~/.codex/config.toml` and otherwise lets the Codex CLI use its own
+default. opencode has no built-in default because its `provider/model` names
+are local to your opencode config. Aliases still require an explicit `_MODEL`,
+`_CMD`, or workmux profile so unsupported model combinations fail with guidance
+instead of launching the wrong model.
 
 For anything `--model` can't express — a different **backend** behind the same
 CLI, extra flags, env vars — set `COCKPIT_AGENT_<ALIAS>_CMD` with the full
@@ -343,10 +344,18 @@ COCKPIT_AGENT_OPENCODE_GLM_MODEL="zai-coding-plan/glm-5.2"
 All variants run side by side in the grid, get scored by the judge like any
 other agents, and the winner merges the same way.
 
-Aliases starting with `claude-`, `codex-`, or `agy-` inherit the right
-trust-store handling and `COCKPIT_TRUST` launch flags. For other names, set
-`COCKPIT_AGENT_<ALIAS>_KIND`, for example `COCKPIT_AGENT_MY_ALIAS_KIND="codex"`
-(the kind is also the CLI that `_MODEL` aliases launch).
+Aliases starting with `claude-`, `codex-`, `opencode-`, or `agy-` inherit the
+right trust-store handling and `COCKPIT_TRUST` launch flags. For other names,
+set `COCKPIT_AGENT_<ALIAS>_KIND`, for example
+`COCKPIT_AGENT_MY_ALIAS_KIND="codex"` (the kind is also the CLI that `_MODEL`
+aliases launch).
+
+`agy-*` names do **not** select Gemini models automatically. Plain `agy` uses
+wtcp's prompt-loading wrapper for the default agy CLI. If you want
+`agy-gemini` (or any other `agy-*`) to be a distinct backend, define it as a
+real workmux profile or set `COCKPIT_AGENT_AGY_GEMINI_CMD`. Older wtcp versions
+could leave aliases like `agy-gemini: ~/.config/wtcp/agy-wm`; `wtcp doctor`
+reports those as stale generic wrappers, not usable backend profiles.
 
 ## Grid layout
 
@@ -381,7 +390,7 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_CLAUDE_CMD` / `COCKPIT_CODEX_CMD` | _(see below)_ | override how claude/codex launch under `COCKPIT_TRUST` |
 | `COCKPIT_AGENT_DEFAULT_MODEL` | _(empty)_ | fallback model for plain agents whose kind has no specific default |
 | `COCKPIT_AGENT_CLAUDE_DEFAULT_MODEL` | `sonnet` | default model for plain `claude` |
-| `COCKPIT_AGENT_CODEX_DEFAULT_MODEL` | `gpt-5` | default model for plain `codex` |
+| `COCKPIT_AGENT_CODEX_DEFAULT_MODEL` | `~/.codex/config.toml` model | default model for plain `codex`; empty falls back to Codex CLI's own default |
 | `COCKPIT_AGENT_OPENCODE_DEFAULT_MODEL` | _(empty)_ | optional opencode default, usually `provider/model` from your opencode config |
 | `COCKPIT_AGENT_<ALIAS>_CMD` | _(empty)_ | full command for a custom/variant agent alias (env vars, backends, extra flags; wins over `_MODEL`) |
 | `COCKPIT_AGENT_<ALIAS>_MODEL` | _(empty)_ | model for an alias: launches the alias kind's CLI with `--model <value>` |

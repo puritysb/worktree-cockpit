@@ -40,6 +40,22 @@ WTCP_CONFIG="${WTCP_CONFIG:-$HOME/.config/wtcp/config}"
 # shellcheck disable=SC1090
 [ -f "$WTCP_CONFIG" ] && . "$WTCP_CONFIG" || true
 
+_codex_user_config_model(){
+  local cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+  [ -f "$cfg" ] || return 0
+  awk '
+    /^[[:space:]]*\[/ { exit }
+    /^[[:space:]]*model[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "", $0)
+      sub(/[[:space:]]+#.*$/, "", $0)
+      gsub(/^"|"$/, "", $0)
+      gsub(/^'\''|'\''$/, "", $0)
+      print
+      exit
+    }
+  ' "$cfg" 2>/dev/null
+}
+
 : "${COCKPIT_AGENTS:=claude codex opencode}"
 # Agents that workmux can't prompt-inject and that need wtcp to send the prompt
 # via tmux send-keys. agy no longer needs this (it launches via a wrapper that
@@ -50,7 +66,7 @@ WTCP_CONFIG="${WTCP_CONFIG:-$HOME/.config/wtcp/config}"
 : "${COCKPIT_LAUNCH_TIMEOUT:=0}"      # seconds to wait for workmux windows; 0 = auto by agent count
 : "${COCKPIT_AGENT_DEFAULT_MODEL:=}"  # fallback for any --model-capable agent kind
 : "${COCKPIT_AGENT_CLAUDE_DEFAULT_MODEL:=sonnet}"
-: "${COCKPIT_AGENT_CODEX_DEFAULT_MODEL:=gpt-5}"
+: "${COCKPIT_AGENT_CODEX_DEFAULT_MODEL:=$(_codex_user_config_model)}"
 : "${COCKPIT_AGENT_OPENCODE_DEFAULT_MODEL:=}"
 # Live status on the grid pane borders (workmux's window-name icons are lost
 # when the agent windows are joined into the grid, so wtcp tracks its own):
@@ -359,7 +375,31 @@ _workmux_profile_names(){
     }
   ' "$CFG" 2>/dev/null | sort -u
 }
-_workmux_profiles_inline(){ _workmux_profile_names | _join_lines; }
+_workmux_profile_is_stale_wtcp_agy_alias(){
+  local p="$1"
+  [ "$(_agent_kind "$p")" = agy ] || return 1
+  [ "$p" != agy ] || return 1
+  _agent_cfg_is_wtcp_agy_wrapper "$p"
+}
+_workmux_usable_profile_names(){
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    _workmux_profile_is_stale_wtcp_agy_alias "$p" && continue
+    printf '%s\n' "$p"
+  done < <(_workmux_profile_names)
+  return 0
+}
+_workmux_stale_profile_names(){
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    _workmux_profile_is_stale_wtcp_agy_alias "$p" && printf '%s\n' "$p"
+  done < <(_workmux_profile_names)
+  return 0
+}
+_workmux_profiles_inline(){ _workmux_usable_profile_names | _join_lines; }
+_workmux_stale_profiles_inline(){ _workmux_stale_profile_names | _join_lines; }
 _similar_profiles(){
   local a="$1" kind="$2" suffix p out=""
   suffix=$(_agent_suffix "$a")
@@ -375,15 +415,20 @@ _similar_profiles(){
       agy)      case "$p" in agy-*) out="${out:+$out }$p" ;; esac ;;
       *)        out="${out:+$out }$p" ;;
     esac
-  done < <(_workmux_profile_names)
+  done < <(_workmux_usable_profile_names)
   printf '%s' "$out"
 }
 _print_available_agents(){
-  local prefix="${1:-}" clis profiles
+  local prefix="${1:-}" clis profiles stale
   clis=$(_installed_agent_clis); profiles=$(_workmux_profiles_inline)
+  stale=$(_workmux_stale_profiles_inline)
   printf '%savailable on this machine:\n' "$prefix"
   printf '%s  installed CLIs:   %s\n' "$prefix" "${clis:-none detected}"
   printf '%s  workmux profiles: %s\n' "$prefix" "${profiles:-none configured}"
+  if [ -n "$stale" ]; then
+    printf '%s  stale wtcp aliases: %s (generic agy wrapper; redefine or remove)\n' "$prefix" "$stale"
+  fi
+  return 0
 }
 _agent_guidance(){
   local a="$1" kind="$2" key kind_key sim suffix
@@ -487,6 +532,19 @@ Run 'wtcp doctor' to inspect what each configured agent will launch.
 EOF
   echo >&2
   _print_available_agents "" >&2
+  return 1
+}
+_warn_agent_problems_short(){
+  local agents="${1:-$COCKPIT_AGENTS}" a problem bad=0
+  for a in $agents; do
+    problem=$(_agent_problem "$a")
+    [ -n "$problem" ] || continue
+    [ "$bad" -eq 0 ] && echo "wtcp: configured agent set has problems:" >&2
+    printf '  - %s: %s\n' "$a" "$(printf '%s\n' "$problem" | sed -n '1p')" >&2
+    bad=1
+  done
+  [ "$bad" -eq 0 ] && return 0
+  echo "Run 'wtcp doctor' for details, or 'wtcp agents <agent...>' to replace the set." >&2
   return 1
 }
 
@@ -1250,7 +1308,11 @@ cmd_score(){
 
 # Show or set the agent set compared by `wtcp start` (persists to ~/.config/wtcp/config).
 cmd_agents(){
-  if [ "$#" -eq 0 ]; then echo "$COCKPIT_AGENTS"; return 0; fi
+  if [ "$#" -eq 0 ]; then
+    echo "$COCKPIT_AGENTS"
+    _warn_agent_problems_short "$COCKPIT_AGENTS" || return 1
+    return 0
+  fi
   [ "$#" -le 6 ] || die "at most 6 agents are supported (got $#)"
   mkdir -p "$(dirname "$WTCP_CONFIG")"
   local val="$*"

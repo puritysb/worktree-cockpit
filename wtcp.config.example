@@ -11,7 +11,8 @@ COCKPIT_AGENTS="claude codex opencode"
 # opencode config (for example: zai-coding-plan/glm-5.2 or mlx/<model-id>).
 COCKPIT_AGENT_DEFAULT_MODEL=""
 COCKPIT_AGENT_CLAUDE_DEFAULT_MODEL="sonnet"
-COCKPIT_AGENT_CODEX_DEFAULT_MODEL="gpt-5"
+# Empty means: use the model from ~/.codex/config.toml, or Codex CLI's own default.
+COCKPIT_AGENT_CODEX_DEFAULT_MODEL=""
 COCKPIT_AGENT_OPENCODE_DEFAULT_MODEL=""
 
 # To compare the same CLI with different MODELS, give each variant a unique
@@ -39,6 +40,10 @@ COCKPIT_AGENT_OPENCODE_DEFAULT_MODEL=""
 # If the alias does not start with claude/codex/opencode/agy, set its kind
 # (trust setup + the CLI that _MODEL launches):
 # COCKPIT_AGENT_MY_ALIAS_KIND="codex"
+#
+# agy-* names are not model selectors. Plain `agy` uses wtcp's prompt-loading
+# wrapper; an `agy-gemini` alias needs a real workmux profile or a full command:
+# COCKPIT_AGENT_AGY_GEMINI_CMD="/path/to/agy-gemini-wrapper"
 
 # Agents that workmux can't prompt-inject: wtcp types the prompt into their pane
 # via tmux send-keys instead. Empty by default (agy launches via a wrapper that
