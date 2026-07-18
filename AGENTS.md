@@ -43,11 +43,16 @@ This file is the design/gotcha memory for working ON wtcp itself.
   (`--squash`, `--rebase`, `--into <branch>`); winner = first non-flag arg.
 - Live pane status: `_spawn_status_watch` (from `_run_round`/`_keep_session`)
   runs one detached `cmd_status_watch` per grid/kept window (pid in
-  `@cockpit_watch`, single-instance, exits when the window dies). It hashes
-  each agent pane's WHOLE visible content per COCKPIT_STATUS_INTERVAL and
-  stamps `@cockpit_status` ⚡ (changing) / 💬 (quiet ≥ COCKPIT_STATUS_IDLE s),
-  rendered by `_style_window`'s border format. Needed because join-pane
-  destroys workmux's own window-name status icons. See gotchas 12–14.
+  `@cockpit_watch`, single-instance, exits when the window dies). It reads
+  workmux's per-pane state files (`~/.local/state/workmux/agents/*.json`, same
+  source the sidebar/dashboard use) via `_workmux_pane_status` and stamps
+  `@cockpit_status` 🤖 (working) / 💬 (waiting) / ✅ (done), rendered by
+  `_style_window`'s border format. Required because join-pane destroys
+  workmux's own window-name status icons; ASSUMES workmux's agent status hooks
+  are installed (`workmux setup`; standard for claude/codex/opencode). Panes
+  with no workmux state (shell/bar/empty pad) get no icon. The same watcher
+  re-tiles on a pane-set change so sub-panes an agent spawns (Claude Code's
+  tmux teammate mode) stay visible — see `_retile_with_teammates`.
 - `prefix Ctrl-R` opens a `display-menu` (run judge / merge-winner / pick-winner
   menu / keep / view-diff / show / copy). After scoring — and via `wtcp winner` /
   the menu's "pick winner" —
@@ -174,14 +179,16 @@ This file is the design/gotcha memory for working ON wtcp itself.
    (Same family as gotcha 8 / cmd_clean's remove-before-kill ordering.)
 13. **`capture-pane -p` pads the viewport with trailing blank lines.** Sampling
    "the last N lines" therefore hashes constant blanks while the real content
-   changes further up — the status watcher must hash the WHOLE captured pane
-   (`cmd_status_watch`), not a `tail -n` of it.
+   changes further up. wtcp's status watcher USED to hash the whole captured
+   pane to dodge this; it now reads workmux's per-pane state files directly
+   (`_workmux_pane_status` / `cmd_status_watch`), so the trap no longer
+   applies — remember it only if you reintroduce capture-pane hashing.
 14. **tmux mangles non-ASCII option values to `_` ON READ when the reading
    client's locale is not UTF-8** (storage keeps the raw bytes; verified by
-   matrix test). All ★/🏆/⚡ parsing (`_scored_rows`, `_scored_winner`, status
-   icons) assumes UTF-8 readers — true for normal shells, but headless tests
-   MUST run every tmux client with `LC_ALL=C.utf8` or scored labels read back
-   as `___` and winner resolution silently fails.
+   matrix test). All ★/🏆/🤖/💬/✅ parsing (`_scored_rows`, `_scored_winner`,
+   status icons) assumes UTF-8 readers — true for normal shells, but headless
+   tests MUST run every tmux client with `LC_ALL=C.utf8` or scored labels read
+   back as `___` and winner resolution silently fails.
 15. **`break-pane` on a single-pane window "succeeds" but only renames (tmux ≥ 3.4).**
    rc=0, EMPTY `-P` output, no new window. `_keep_session` must detect the
    1-pane case (keep/pick re-run inside an already-kept window) and rename in
@@ -189,6 +196,21 @@ This file is the design/gotcha memory for working ON wtcp itself.
    old window would destroy the live session. Related guard: `cmd_pick` /
    `cmd_abandon` only `kill-window` windows whose name matches the `wt:` prefix,
    so running them from a plain shell window can't destroy that window.
+16. **A grid agent that spawns sub-panes (Claude Code's `teammateMode: tmux`,
+   or any agent that fans out via tmux) breaks the fixed grid shape.** wtcp
+   doesn't BLOCK the spawning — that would cripple the agent — instead
+   `cmd_status_watch` detects the pane-set change and calls
+   `_retile_with_teammates`: newcomers (no `@worktree`/`@pane_label`) get
+   stamped `@pane_label "teammate"`, the command bar is briefly broken out,
+   the agent area is re-tiled `select-layout tiled`, then the bar is rejoined
+   at full width / `BAR_HEIGHT` (verified bottom strip — see
+   `tests/test_status_retile.sh`). Side effect: once teammates appear the grid
+   is in `tiled` for good; the original 2×2/2×3 shape is NOT restored when
+   teammates later vanish (acceptable — tiled is stable, fixed shape only at
+   fresh assembly). The judge (`_judge_one` / `_scored_rows`) iterates panes
+   by `@worktree`, so teammate panes are naturally skipped — they're never fed
+   to the LLM judge and never show ★ scores. Teammates DO get 🤖/💬/✅ from
+   workmux's status hooks (they're real agent processes), which is desirable.
 
 ## Design decisions (evaluated & rejected — don't re-litigate)
 
@@ -211,7 +233,7 @@ Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD` (full command, wins
 `COCKPIT_AGENT_<ALIAS>_KIND`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
 `COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`,
 `COCKPIT_AGY_DELAY`, `COCKPIT_LAUNCH_TIMEOUT`, `COCKPIT_STATUS`,
-`COCKPIT_STATUS_INTERVAL`, `COCKPIT_STATUS_IDLE`.
+`COCKPIT_STATUS_INTERVAL`.
 Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_MODEL`,
 `COCKPIT_NAMER_AUTH`, `COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
 Judge: `COCKPIT_JUDGE_URL`, `COCKPIT_JUDGE_AUTH` (Authorization header for hosted
@@ -223,6 +245,14 @@ scoring; headless/tests).
 Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path).
 
 ## Testing wtcp without real agents
+
+Fast unit-style regression tests (no real agents/tmux/workmux pollution) live
+under `tests/`. Run them after touching `_workmux_pane_status`,
+`_retile_with_teammates`, `cmd_status_watch`, or `_apply_grid_layout`:
+
+```bash
+bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
+```
 
 Real agents are interactive TUIs; to exercise the machinery headlessly, register
 **fake string agents** in the *global* workmux config (`~/.config/workmux/config.yaml`,
@@ -243,6 +273,8 @@ interactive agents, not for the join/layout/score machinery.
 ## Dependencies
 
 Required: `tmux`, `workmux` (`brew install raine/workmux/workmux`), `git`, `jq`,
-`curl`. Optional: the agent CLIs being compared, and a Node + Xcode toolchain to
-build the FM helper. Scoring needs a configured OpenAI-compatible
-`/chat/completions` endpoint and, for most servers, a model name.
+`curl`. Also required for live grid status: workmux's per-agent status hooks
+(run `workmux setup` once — installs hooks for claude/codex/opencode/gemini/...).
+Optional: the agent CLIs being compared, and a Node + Xcode toolchain to build
+the FM helper. Scoring needs a configured OpenAI-compatible `/chat/completions`
+endpoint and, for most servers, a model name.

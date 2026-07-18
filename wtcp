@@ -68,12 +68,14 @@ _codex_user_config_model(){
 : "${COCKPIT_AGENT_CLAUDE_DEFAULT_MODEL:=sonnet}"
 : "${COCKPIT_AGENT_CODEX_DEFAULT_MODEL:=$(_codex_user_config_model)}"
 : "${COCKPIT_AGENT_OPENCODE_DEFAULT_MODEL:=}"
-# Live status on the grid pane borders (workmux's window-name icons are lost
-# when the agent windows are joined into the grid, so wtcp tracks its own):
-# ⚡ = output changed recently (agent working) · 💬 = quiet (waiting/done).
+# Live status on the grid pane borders. workmux's window-name icons are lost
+# when agent windows are joined into the grid, so wtcp reads workmux's per-pane
+# state files (the same source the sidebar/dashboard use) and re-stamps the
+# icon on each pane border: 🤖 working · 💬 waiting · ✅ done. Requires
+# workmux's agent status hooks (installed by `workmux setup` for claude/codex/
+# opencode/...). If a pane has no workmux state (shell/bar/empty pad), no icon.
 : "${COCKPIT_STATUS:=1}"              # 0 disables the watcher
 : "${COCKPIT_STATUS_INTERVAL:=3}"     # seconds between polls
-: "${COCKPIT_STATUS_IDLE:=6}"         # quiet for this long -> 💬
 # OPT-IN: 1 = launch agents with their folder-trust/permission/sandbox bypass
 # flags so a brand-new project auto-starts. This disarms approval/sandbox gates
 # (the agents auto-approve all tool use) and edits the global workmux config, so
@@ -113,6 +115,21 @@ fi
 # used by agy) on `add`, and a select UI on `remove`. Run every workmux call with
 # stdin closed so it stays non-interactive; spawned agents still get pane TTYs.
 _wm(){ command workmux "$@" </dev/null; }
+# Read workmux's tracked status for a tmux pane (e.g. %14). workmux's agent
+# status hooks write per-pane JSON under ~/.local/state/workmux/agents/ (same
+# state the sidebar/dashboard read). wtcp consumes that directly rather than
+# re-hashing pane content: richer (has a real "done" state), authoritative
+# (the agent reports its own state), and immune to capture-pane's trailing-
+# blank-padding trap. Echoes "working" | "waiting" | "done" | "" (not tracked).
+_workmux_pane_status(){   # $1 = pane id like %14
+  local p="$1" f
+  [ -n "$p" ] || return 0
+  for f in "$HOME/.local/state/workmux/agents"/*__"%25${p#%}.json"; do
+    [ -f "$f" ] || return 0
+    jq -r '.status // empty' "$f" 2>/dev/null
+    return 0
+  done
+}
 need_tmux(){ [ -n "${TMUX:-}" ] || die "run inside a tmux session"; }
 need_repo(){ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run inside a git repository"; }
 # Resolve the pane/window wtcp was INVOKED from. Prefer $TMUX_PANE (tmux sets
@@ -703,37 +720,70 @@ _style_window(){   # $1=window id
   tmux set-window-option -t "$w" pane-active-border-style 'fg=colour45' 2>/dev/null || true
 }
 
+# When a grid agent spawns a sub-pane in the same window (Claude Code's tmux
+# teammate mode, or any agent that fans out via tmux), the fixed grid shape
+# would overflow and panes would vanish / "create pane failed". We don't BLOCK
+# the spawning — that would cripple the agent — we re-tile so every pane stays
+# visible and stamp the newcomer as a teammate. The command bar is briefly
+# broken out so the retile only reshuffles the agent area, then re-joined at
+# full width / BAR_HEIGHT (its original form) — verified to land bottom strip.
+_retile_with_teammates(){   # $1 = window id
+  local w="$1" p wt lbl bar bscr
+  # Tag newcomer panes (no @worktree, no @pane_label) as teammates so they
+  # read as part of the crew, not as mystery damage to the grid.
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    wt=$(tmux show-options -pqv -t "$p" @worktree 2>/dev/null || true)
+    lbl=$(tmux show-options -pqv -t "$p" @pane_label 2>/dev/null || true)
+    if [ -z "$wt" ] && [ -z "$lbl" ]; then
+      tmux set-option -p -t "$p" @pane_label "teammate"
+    fi
+  done < <(tmux list-panes -t "$w" -F '#{pane_id}' 2>/dev/null || true)
+  # Break the bar into a one-pane scratch window so the retile doesn't fold it
+  # into the grid; rejoin it afterwards as the full-width bottom strip.
+  bar=$(tmux list-panes -t "$w" -F '#{pane_id}' -f '#{==:#{@cockpit_bar},1}' 2>/dev/null | head -1)
+  if [ -n "$bar" ]; then
+    bscr=$(tmux break-pane -d -P -F '#{window_id}' -s "$bar" -n "_wtcp_bar" 2>/dev/null || true)
+  else
+    bscr=""
+  fi
+  tmux select-layout -t "$w" tiled 2>/dev/null || true
+  _style_window "$w"
+  if [ -n "$bscr" ]; then
+    # Rejoin at the bottom, full window width, BAR_HEIGHT rows. (The scratch
+    # window auto-closes when its only pane leaves; kill-window would warn.)
+    tmux join-pane -d -s "$bscr" -t "$w" -v -l "$BAR_HEIGHT" -f 2>/dev/null || true
+  fi
+}
+
 # Live per-pane agent status for a grid/kept window. Joining the agent windows
-# into the grid destroys workmux's own window-name status icons, so wtcp polls
-# each agent pane's recent output: changed since last poll -> ⚡ (working),
-# quiet for COCKPIT_STATUS_IDLE seconds -> 💬 (waiting for input / done). The
-# icon is stored in the pane's @cockpit_status and rendered by _style_window's
+# into the grid destroys workmux's own window-name status icons, so wtcp reads
+# workmux's per-pane state files (same source as the sidebar/dashboard) and
+# re-stamps 🤖/💬/✅ on each pane's @cockpit_status, rendered by _style_window's
 # border format. One watcher per window (pid in @cockpit_watch); it exits by
-# itself when the window disappears (pick/keep/abandon/clean).
+# itself when the window disappears (pick/keep/abandon/clean). The watcher also
+# re-tiles on a pane-set change so sub-panes spawned by an agent (Claude Code's
+# tmux teammate mode) stay visible — see _retile_with_teammates above.
 cmd_status_watch(){
   local w="${1:-}"; [ -n "$w" ] || die 'status-watch <window-id>'
   local existing; existing=$(tmux show-options -wqv -t "$w" @cockpit_watch 2>/dev/null || true)
   if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then return 0; fi
   tmux set-option -w -t "$w" @cockpit_watch "$$" 2>/dev/null || return 0
-  local p wt h prev seen now st
+  local p st last_count cur_count
+  last_count=$(tmux list-panes -t "$w" -F x 2>/dev/null | grep -c . || true)
   while tmux list-panes -t "$w" >/dev/null 2>&1; do
-    now=$(date +%s)
+    cur_count=$(tmux list-panes -t "$w" -F x 2>/dev/null | grep -c . || true)
+    if [ "$cur_count" != "$last_count" ]; then
+      _retile_with_teammates "$w"
+      last_count="$cur_count"
+    fi
     while IFS= read -r p; do
-      wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
-      # Hash the WHOLE visible pane: capture-pane pads the viewport with
-      # trailing blank lines, so a `tail -n` sample would hash constant blanks
-      # while the real content changes further up.
-      h=$(tmux capture-pane -p -t "$p" 2>/dev/null | cksum 2>/dev/null || true)
-      prev=$(tmux show-options -pqv -t "$p" @cockpit_hash 2>/dev/null || true)
-      if [ "$h" != "$prev" ]; then
-        tmux set-option -p -t "$p" @cockpit_hash "$h" 2>/dev/null || true
-        tmux set-option -p -t "$p" @cockpit_seen "$now" 2>/dev/null || true
-        st="⚡"
-      else
-        seen=$(tmux show-options -pqv -t "$p" @cockpit_seen 2>/dev/null || true)
-        [ -n "$seen" ] || seen=$now
-        if [ $(( now - seen )) -ge "$COCKPIT_STATUS_IDLE" ]; then st="💬"; else st="⚡"; fi
-      fi
+      case "$(_workmux_pane_status "$p")" in
+        working) st="🤖" ;;
+        waiting) st="💬" ;;
+        done)    st="✅" ;;
+        *)       st="" ;;
+      esac
       [ "$(tmux show-options -pqv -t "$p" @cockpit_status 2>/dev/null || true)" = "$st" ] \
         || tmux set-option -p -t "$p" @cockpit_status "$st" 2>/dev/null || true
     done < <(tmux list-panes -t "$w" -F '#{pane_id}' 2>/dev/null || true)
@@ -1019,6 +1069,8 @@ Use both evidence streams:
 - If the Diff has substantive changes, treat it as the source of truth for implementation correctness, completeness, and maintainability. Terminal Output is supporting evidence for tests run, reasoning, claimed limitations, and whether the agent noticed important issues.
 - If the Diff is empty or irrelevant, evaluate the substance, accuracy, and actionability of the Terminal Output instead. Do not penalize an empty diff by itself for analysis, review, debugging, planning, or research tasks.
 
+Verify against the evidence, not the agent's own claims: cross-check every Terminal Output claim (e.g. that it added, fixed, or tested something) against the Diff and visible output — claims the Diff or output does not substantiate are unsupported and must lose points. Confirm the change actually targets the reported symptom and instruction scope: correct code applied at the wrong layer, where the reported problem would still persist, is a miss regardless of code quality. Treat the instruction timeline as the spec — enumerate what it explicitly requires and penalize each unmet requirement, even if the agent produced unrelated extra work.
+
 Be calibrated and discriminating: 10 = complete and correct with strong evidence; 7-8 = solid with manageable gaps; 5 = partial or shallow; 0-3 = wrong, hand-wavy, misleading, or unfinished. Do not reward or penalize language choice unless the instruction timeline requires a specific language.
 
 Base your judgment only on the evidence shown. Return STRICT JSON only:
@@ -1038,7 +1090,9 @@ Use both evidence streams for every agent:
 - If an agent's Diff has substantive changes, treat it as the source of truth for implementation correctness, completeness, and maintainability. Terminal Output is supporting evidence for tests run, reasoning, claimed limitations, and whether the agent noticed important issues.
 - If an agent's Diff is empty or irrelevant, evaluate the substance, accuracy, and actionability of the Terminal Output instead. Do not penalize an empty diff by itself for analysis, review, debugging, planning, or research tasks.
 
-Compare head-to-head on correctness, completeness, depth, actionability, and fit to the latest instructions. Be calibrated and discriminating: spread scores when there are real differences, reserve 9-10 for genuinely complete and correct work, and avoid declaring a winner on style alone. Do not reward or penalize language choice unless the instruction timeline requires a specific language.
+Verify each agent against the evidence, not its own claims: cross-check every Terminal Output claim (e.g. that it added, fixed, or tested something) against that agent's Diff and visible output — unsubstantiated claims are unsupported and must lose points. Confirm each change actually targets the reported symptom and instruction scope: correct code applied at the wrong layer, where the reported problem would still persist, is a miss regardless of code quality, and must not tie or beat an agent that fixed the real issue. Treat the instruction timeline as the spec: enumerate what it explicitly requires and penalize each unmet requirement, even if the agent did extra unrelated work.
+
+Rank head-to-head on whether the reported problem is actually solved and every explicit requirement is met — not on code style, refactor cleanliness, or effort shown. Be calibrated and discriminating: spread scores when there are real differences, reserve 9-10 for genuinely complete and correct work. Do not reward or penalize language choice unless the instruction timeline requires a specific language.
 
 Use only the evidence shown. Return STRICT JSON only, no prose:
 {"rankings":[{"name":"<exact agent name>","score":N,"reason":"multiple concise bullet lines separated by \n"}],"winner":"<exact name>","summary":"multiple concise bullet lines separated by \n"}
@@ -1774,6 +1828,22 @@ cmd_doctor(){
   for t in tmux workmux git jq curl; do command -v "$t" >/dev/null 2>&1 || miss="$miss$t "; done
   if [ -n "$miss" ]; then printf '  deps             MISSING: %s\n' "$miss"
   else printf '  deps             tmux workmux git jq curl (all present)\n'; fi
+  # Live grid status reads workmux's per-pane state files; those are written by
+  # workmux's agent status hooks (installed by `workmux setup`). The cleanest
+  # signal that they're ACTIVE is a recently-written state file.
+  local agents_dir="$HOME/.local/state/workmux/agents"
+  if [ -d "$agents_dir" ]; then
+    local recent
+    recent=$(find "$agents_dir" -type f -name '*.json' -mmin -1440 2>/dev/null | head -1)
+    if [ -n "$recent" ]; then
+      printf '  status hooks     active (workmux state written in last 24h — 🤖/💬/✅ will show)\n'
+    else
+      printf '  status hooks     STALE — no workmux state written in 24h.\n'
+      printf '                   run "workmux setup" to install agent status hooks (needed for live grid status).\n'
+    fi
+  else
+    printf '  status hooks     MISSING — run "workmux setup" (needed for live 🤖/💬/✅ grid status).\n'
+  fi
   echo
   echo "  Mouse / per-pane scroll / keys misbehaving? Detach tmux (prefix d) and"
   echo "  re-run 'wtcp start' (or 'wtcp setup'). A long-lived session can leave the"

@@ -133,11 +133,14 @@ Clicking any pane (focused or not) selects it; the mouse wheel scrolls the pane
 **under the cursor** — agents that handle the mouse themselves get the wheel
 events directly, other panes scroll tmux history.
 
-Each agent pane's border also shows a **live status**: `⚡` while the agent is
-producing output, `💬` once it has been quiet for a few seconds (waiting for
-input or done). workmux's own window-name status icons can't survive the grid
-(the agent windows are joined into it), so wtcp tracks this itself — tune or
-disable with `COCKPIT_STATUS*` (see [Configuration](#configuration)).
+Each agent pane's border also shows a **live status** straight from workmux:
+`🤖` while the agent is working, `💬` when it's waiting for input, `✅` when
+it's done. workmux's own window-name status icons can't survive the grid
+(the agent windows are joined into it), so wtcp reads workmux's per-pane
+state files (the same source the sidebar/dashboard use) and re-stamps the
+icon on each border. This requires workmux's agent status hooks to be
+installed — run `workmux setup` once (covers claude/codex/opencode/...).
+Tune or disable the watcher with `COCKPIT_STATUS*` (see [Configuration](#configuration)).
 
 `wtcp pick` and `wtcp merge` also pass workmux merge strategies through:
 `wtcp pick <name> --squash`, `--rebase`, or `--into <branch>` (stacked
@@ -379,8 +382,8 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_PROMPT_LOG_CHARS` | `12000` | instruction timeline budget for initial prompt + follow-ups |
 | `COCKPIT_JUDGE_TIMEOUT` | `120` | seconds per judge request |
 | `COCKPIT_LAUNCH_TIMEOUT` | `0` | seconds to wait for agent windows; `0` auto-scales for slow cold worktree hooks |
-| `COCKPIT_STATUS` | `1` | live ⚡/💬 status on grid pane borders (`0` disables) |
-| `COCKPIT_STATUS_INTERVAL` / `COCKPIT_STATUS_IDLE` | `3` / `6` | status poll interval / seconds of quiet before 💬 |
+| `COCKPIT_STATUS` | `1` | live 🤖/💬/✅ status on grid pane borders, read from workmux's per-pane state (`0` disables) |
+| `COCKPIT_STATUS_INTERVAL` | `3` | status poll interval (seconds) |
 | `COCKPIT_POPUP_WIDTH` / `COCKPIT_POPUP_HEIGHT` | `92%` / `85%` | tmux popup size for judge details |
 | `COCKPIT_POPUP_DIM` / `COCKPIT_POPUP_DIM_STYLE` | `1` / `fg=colour244,bg=colour235` | dim pane styles behind popups; tmux has no true blur/backdrop |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
