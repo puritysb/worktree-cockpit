@@ -196,7 +196,41 @@ This file is the design/gotcha memory for working ON wtcp itself.
    old window would destroy the live session. Related guard: `cmd_pick` /
    `cmd_abandon` only `kill-window` windows whose name matches the `wt:` prefix,
    so running them from a plain shell window can't destroy that window.
-16. **A grid agent that spawns sub-panes (Claude Code's `teammateMode: tmux`,
+16. **wtcp shares mutable state with plain `workmux` — never widen a blast radius.**
+   The user drives workmux directly in the same repo, so wtcp's destructive and
+   config-writing paths must be SCOPED to what wtcp itself created:
+   - `cmd_clean` removes only worktrees stamped `@worktree` on panes of `wt:`
+     windows (`_cockpit_worktrees`). The old `_wm remove --all -f` also deleted
+     worktrees the user made by hand, uncommitted changes and all — that is now
+     `wtcp clean --all`, behind a typed confirmation. Worktrees whose grid
+     window is already gone are invisible to the scoped clean; `--all` is the
+     escape hatch.
+   - `_set_agent_cfg` writes the user's OWN `~/.config/workmux/config.yaml`.
+     It backs the file up once per run (`.wtcp-bak`), tags entries it writes
+     with `# wtcp-managed`, and REFUSES to touch anything without that tag —
+     hand-written entries (especially multi-line `type:`/`command:`/`args:`/
+     `env:` blocks, which the line-based rewrite would collapse into a scalar)
+     survive. `_ensure_agent_configs` warns via `_warn_cfg_kept` that the
+     agent's `COCKPIT_AGENT_*_CMD/_MODEL` is being ignored.
+   `wtcp doctor`'s `_doctor_workmux_compat` surfaces the rest: `main_branch`,
+   `base_branch`, an incompatible `window_prefix`/`worktree_prefix`, a custom
+   `panes:`/`windows:` layout, and which agent entries are wtcp's vs the user's.
+17. **Base branch and merge target come from workmux, not from wtcp's guesses.**
+   `_run_round` now ALWAYS passes `--base "$round_base"`. Without it workmux
+   branches from its configured `base_branch` while wtcp stamps the current ref
+   as `@cockpit_base` — the judge then diffs against a ref nobody branched
+   from, and `cmd_pick`'s has-changes test picks merge-vs-keep wrongly.
+   `_diff_base` falls back to workmux's `main_branch` before guessing
+   `main`/`master`. Starting a round inside a LINKED worktree is ambiguous
+   (`workmux merge` always targets `main_branch`, not the branch you're on), so
+   `_run_round` warns and stamps `@cockpit_from_worktree`; `cmd_pick` then
+   refuses to merge until `--into` says which branch. A FORK is deliberately
+   exempt — its base is a throwaway round branch whose commits reach main
+   through the winner anyway.
+   `_in_linked_worktree` resolves both git dirs with `cd … && pwd -P`: on macOS
+   git hands back `/var/...` for one and `/private/var/...` for the other, and
+   the naive comparison warned on every round.
+18. **A grid agent that spawns sub-panes (Claude Code's `teammateMode: tmux`,
    or any agent that fans out via tmux) breaks the fixed grid shape.** wtcp
    doesn't BLOCK the spawning — that would cripple the agent — instead
    `cmd_status_watch` detects the pane-set change and calls
@@ -248,11 +282,18 @@ Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path
 
 Fast unit-style regression tests (no real agents/tmux/workmux pollution) live
 under `tests/`. Run them after touching `_workmux_pane_status`,
-`_retile_with_teammates`, `cmd_status_watch`, or `_apply_grid_layout`:
+`_retile_with_teammates`, `cmd_status_watch`, or `_apply_grid_layout` (first
+file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
+`_in_linked_worktree` (second):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
+bash tests/test_workmux_coexist.sh   # 29 assertions; also a throwaway git repo
 ```
+
+Both extract functions straight out of `wtcp` with `extract_fn` (an awk range
+from `name()` to the closing `}` in column 1) rather than sourcing the script,
+so a helper they cover must keep its brace on its own line.
 
 Real agents are interactive TUIs; to exercise the machinery headlessly, register
 **fake string agents** in the *global* workmux config (`~/.config/workmux/config.yaml`,

@@ -21,7 +21,8 @@
 #   wtcp grid                           g                     jump to the grid window
 #   wtcp agents [names...]                                    show / set the agents compared (default: claude codex opencode)
 #   wtcp list                           ls                    list active worktrees
-#   wtcp clean                          clear                 remove ALL compare worktrees + close grid windows
+#   wtcp clean [--all]                  clear                 remove this round's worktrees + close grid windows
+#                                                             (--all = every workmux worktree in the repo; asks first)
 #   wtcp setup                                                (re)install the in-grid keys + mouse (auto-run by `start`)
 #   wtcp doctor                                               check tmux/mouse/agents/deps + print troubleshooting tips
 #
@@ -132,6 +133,31 @@ _workmux_pane_status(){   # $1 = pane id like %14
 }
 need_tmux(){ [ -n "${TMUX:-}" ] || die "run inside a tmux session"; }
 need_repo(){ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run inside a git repository"; }
+# True when the cwd is a LINKED worktree (one workmux made, or any `git worktree
+# add`) rather than the repository's main worktree.
+_in_linked_worktree(){
+  local gd common
+  gd=$(git rev-parse --git-dir 2>/dev/null) || return 1
+  common=$(git rev-parse --git-common-dir 2>/dev/null) || return 1
+  # Resolve BOTH the same way: git may hand back one path through a symlink
+  # (/var/... vs /private/var/... on macOS) and the other already resolved, and
+  # a spurious mismatch would warn about a merge target on every single round.
+  gd=$(cd "$gd" 2>/dev/null && pwd -P) || return 1
+  common=$(cd "$common" 2>/dev/null && pwd -P) || return 1
+  [ "$gd" != "$common" ]
+}
+# Starting a round from inside another worktree is a natural move ("I'm on
+# feat-x, fan this sub-task out") but the merge target is NOT what it looks
+# like: `workmux merge` always targets main_branch, so the winner would land on
+# main rather than the branch you're standing on. Warn; don't block.
+_warn_linked_worktree(){
+  _in_linked_worktree || return 0
+  local cur main; cur=$(_current_ref); main=$(_workmux_main_branch)
+  say "note: this is a LINKED worktree (branch '$cur'), not the main one."
+  say "      agents branch from '$cur', but 'wtcp pick' merges into workmux's"
+  say "      main branch${main:+ ('$main')} — pass --into '$cur' to stack onto this branch instead."
+  return 0
+}
 # Resolve the pane/window wtcp was INVOKED from. Prefer $TMUX_PANE (tmux sets
 # it for every process inside a pane): with NO attached client (headless or
 # scripted use), bare `tmux display -p` can resolve to a DIFFERENT pane/window
@@ -336,13 +362,96 @@ slugify(){
   [ -n "$out" ] && printf '%s' "$out" || printf 'task-%s' "$(date +%H%M%S)"
 }
 
+# ===== workmux config (shared with plain `workmux` use) =====
+# wtcp and workmux read the SAME config files, and the user may drive workmux
+# directly in the same repo. Anything read here is workmux's policy, not
+# wtcp's, so wtcp must follow it rather than assume its own defaults.
+_workmux_cfg_global(){ printf '%s' "$HOME/.config/workmux/config.yaml"; }
+# Top-level scalar from the project `.workmux.yaml` (wins) or the global config.
+# Deliberately shallow: only unindented `key: value` lines, comments skipped.
+_workmux_cfg_value(){   # $1 = key -> value or ""
+  local key="$1" f root v
+  root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  for f in ${root:+"$root/.workmux.yaml"} "$(_workmux_cfg_global)"; do
+    [ -f "$f" ] || continue
+    v=$(awk -v k="$key" '
+      $0 ~ "^" k ":" { sub("^" k ":[[:space:]]*", ""); sub(/[[:space:]]*#.*$/, ""); print; exit }
+    ' "$f" 2>/dev/null || true)
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 0
+}
+# Branch `workmux merge` targets by default, and the ref new worktrees branch
+# from. Empty when unset — callers fall back on their own.
+_workmux_main_branch(){ _workmux_cfg_value main_branch; }
+
+# ===== Writing the workmux agents map =====
+# DANGEROUS: this file is the user's own workmux config; entries they wrote by
+# hand drive plain `workmux add -a <name>` too. Rules:
+#   - back it up once per run before the first write,
+#   - only ever rewrite entries wtcp itself wrote (tagged with the marker below),
+#   - never touch a hand-written entry, and never collapse a multi-line block
+#     definition (`type:`/`command:`/`args:`/`env:`) into a one-line scalar.
+WTCP_CFG_MARK="# wtcp-managed"
+WTCP_CFG_BACKED_UP=0
+_backup_workmux_cfg(){
+  local CFG; CFG=$(_workmux_cfg_global)
+  [ "$WTCP_CFG_BACKED_UP" = 0 ] || return 0
+  [ -f "$CFG" ] || return 0
+  cp "$CFG" "$CFG.wtcp-bak" 2>/dev/null || true
+  WTCP_CFG_BACKED_UP=1
+}
+# True when the agent's entry carries wtcp's marker (i.e. wtcp wrote it).
+_agent_cfg_is_wtcp_managed(){   # $1 = agent
+  local CFG; CFG=$(_workmux_cfg_global)
+  [ -f "$CFG" ] || return 1
+  awk -v a="$1" -v m="$WTCP_CFG_MARK" '
+    $0 ~ "^[[:space:]]*" a ":" && index($0, m) { f=1 }
+    END { exit f ? 0 : 1 }
+  ' "$CFG" 2>/dev/null
+}
+# The command of a one-line agent entry (`  name: "cmd"   # comment`), unquoted.
+# Empty for a block definition, which has no scalar of its own.
+_agent_cfg_command(){   # $1 = agent
+  local CFG v; CFG=$(_workmux_cfg_global)
+  [ -f "$CFG" ] || return 0
+  v=$(awk -v a="$1" '
+    !seen && $0 ~ "^[[:space:]]*" a ":" {
+      sub("^[[:space:]]*" a ":[[:space:]]*", ""); sub(/[[:space:]]*#.*$/, ""); print; seen=1
+    }
+  ' "$CFG" 2>/dev/null || true)
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+  printf '%s' "$v"
+}
+# True when the agent's entry is a multi-line block (nested keys follow it).
+_agent_cfg_is_block(){   # $1 = agent
+  local CFG; CFG=$(_workmux_cfg_global)
+  [ -f "$CFG" ] || return 1
+  # NOTE: no early `exit` here — awk's exit jumps to END, whose own exit code
+  # would win and always report "not a block".
+  awk -v a="$1" '
+    seen && !checked { blk = ($0 ~ /^[[:space:]]{4,}[^[:space:]#]/); checked = 1 }
+    !seen && $0 ~ "^[[:space:]]*" a ":" { seen = 1 }
+    END { exit blk ? 0 : 1 }
+  ' "$CFG" 2>/dev/null
+}
 # Set/replace an agent's command in the workmux global agents map (idempotent).
 # (workmux honors overrides of builtin names and appends the prompt as -- "...".)
+# Refuses to overwrite a hand-written entry — returns 1 so the caller can warn.
 _set_agent_cfg(){
-  local CFG="$HOME/.config/workmux/config.yaml" agent="$1" cmd="$2" line esc
+  local CFG agent="$1" cmd="$2" line esc
+  CFG=$(_workmux_cfg_global)
+  if [ -f "$CFG" ] && _agent_cfg_exists "$agent" && ! _agent_cfg_is_wtcp_managed "$agent"; then
+    # Nothing to warn about when the entry already says exactly what wtcp would
+    # write — that's the normal upgrade path from before the marker existed.
+    [ "$(_agent_cfg_command "$agent")" = "$cmd" ] && return 0
+    return 1   # user-authored: leave it alone and let the caller warn
+  fi
   mkdir -p "$(dirname "$CFG")"; [ -f "$CFG" ] || printf 'nerdfont: true\n' > "$CFG"
+  _backup_workmux_cfg
   esc="${cmd//\\/\\\\}"; esc="${esc//\"/\\\"}"
-  line="  $agent: \"$esc\""
+  line="  $agent: \"$esc\"   $WTCP_CFG_MARK"
   if grep -qE "^[[:space:]]*$agent:" "$CFG"; then
     awk -v a="$agent" -v w="$line" '
       $0 ~ "^[[:space:]]*" a ":" { print w; skip=1; next }
@@ -578,6 +687,8 @@ _warn_agent_problems_short(){
 #  - opencode: left as the builtin (no trust prompt).
 # Note: this edits the workmux GLOBAL config, so it also affects plain `workmux
 # -a claude/codex`. Set COCKPIT_TRUST=0 (default) to keep the safety prompts.
+# Hand-written entries are NEVER overwritten (see _set_agent_cfg) — wtcp warns
+# and launches whatever the user's own profile says instead.
 _ensure_agent_configs(){
   local a flag="" kind cmd
   [ "${COCKPIT_TRUST:-0}" = 1 ] && flag="--dangerously-skip-permissions "
@@ -589,12 +700,23 @@ _ensure_agent_configs(){
     if [ "$kind" = agy ] && [ "$a" = "$kind" ] && [ -z "$(_agent_cmd "$a")" ]; then
       local W="$HOME/.config/wtcp/agy-wm"; mkdir -p "$(dirname "$W")"
       printf '#!/bin/sh\np=$(cat .workmux/PROMPT-*.md 2>/dev/null)\nexec agy %s-i "$p"\n' "$flag" > "$W"; chmod +x "$W"
-      _set_agent_cfg "$a" "$W"
+      _set_agent_cfg "$a" "$W" || _warn_cfg_kept "$a"
       continue
     fi
     cmd=$(_agent_launch_cmd "$a")
-    [ -n "$cmd" ] && _set_agent_cfg "$a" "$cmd"
+    [ -n "$cmd" ] && { _set_agent_cfg "$a" "$cmd" || _warn_cfg_kept "$a"; }
   done
+  return 0
+}
+# wtcp wanted to write this agent's launch command but the workmux config
+# already defines it by hand. Say so loudly — silently launching a different
+# command than COCKPIT_AGENT_*_CMD/_MODEL asks for is worse than the conflict.
+_warn_cfg_kept(){   # $1 = agent
+  local a="$1" what="hand-written entry"
+  _agent_cfg_is_block "$a" && what="multi-line block definition"
+  say "[$a]: keeping your workmux $what in $(_workmux_cfg_global) (not overwritten)."
+  say "      wtcp's launch settings for [$a] are IGNORED. To let wtcp manage it,"
+  say "      delete that entry, or append '$WTCP_CFG_MARK' to its line."
   return 0
 }
 
@@ -813,11 +935,19 @@ _run_round(){
   local prompt="$1" task="$2" base="${3:-}"
   _validate_agents "$COCKPIT_AGENTS"
   _ensure_agent_configs   # agy wrapper + (COCKPIT_TRUST) tool-approval bypass flags for claude/codex
-  local root; root=$(git rev-parse --show-toplevel)
+  local root from_worktree=0; root=$(git rev-parse --show-toplevel)
+  # A round started from a linked worktree (not a fork) has an ambiguous merge
+  # target; remember that so cmd_pick can make the user choose.
+  if [ -z "$base" ] && _in_linked_worktree; then from_worktree=1; _warn_linked_worktree; fi
   local round_base; round_base="${base:-$(_current_ref)}"
   _pretrust "$task" "$root"   # (COCKPIT_TRUST) pre-trust the claude/codex worktrees so they auto-start
   local addargs=(); for a in $COCKPIT_AGENTS; do addargs+=(-a "$a"); done
-  [ -n "$base" ] && addargs+=(--base "$base")
+  # ALWAYS pin the base explicitly. Without --base, workmux branches from its
+  # own `base_branch` config while wtcp records the CURRENT ref as the judge's
+  # diff base — when the user has `base_branch: main` set and starts a round
+  # from a feature branch the two disagree, which corrupts every score AND the
+  # has-changes test in cmd_pick that decides merge-vs-keep.
+  addargs+=(--base "$round_base")
 
   local nag neww found_count add_status=0 timeout_s deadline now
   nag=0; for a in $COCKPIT_AGENTS; do nag=$((nag+1)); done
@@ -850,6 +980,7 @@ _run_round(){
   _prompt_log_set "$cwin" "[initial] $prompt"               # full instruction timeline for scoring
   tmux set-option -w -t "$cwin" @cockpit_score_round 0
   tmux set-option -w -t "$cwin" @cockpit_base "$round_base"  # used as the judge diff base
+  tmux set-option -w -t "$cwin" @cockpit_from_worktree "$from_worktree"
   local apanes=() join_lines=() line idx
   while IFS= read -r line; do [ -n "$line" ] && join_lines+=("$line"); done <<< "$neww"
   # join-pane inserts each joined pane before the existing panes in this tmux
@@ -1041,7 +1172,14 @@ _diff_base(){   # $1=worktree path $2=requested base -> validated base ref (fall
     base=""
   fi
   if [ -z "$base" ]; then
-    base=main; git -C "$path" rev-parse --verify -q main >/dev/null 2>&1 || base=master
+    # Fall back on workmux's configured main branch before guessing main/master
+    # — a repo whose workmux main_branch is e.g. `develop` would otherwise be
+    # judged against a ref it never branched from.
+    base=$(_workmux_main_branch)
+    [ -n "$base" ] && git -C "$path" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1 || base=""
+    if [ -z "$base" ]; then
+      base=main; git -C "$path" rev-parse --verify -q main >/dev/null 2>&1 || base=master
+    fi
   fi
   printf '%s' "$base"
 }
@@ -1560,6 +1698,7 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   prompt_log=$(_prompt_log_get "$cwin")
   score_round=$(tmux show-options -wqv -t "$cwin" @cockpit_score_round 2>/dev/null || true)
   base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
+  local from_wt; from_wt=$(tmux show-options -wqv -t "$cwin" @cockpit_from_worktree 2>/dev/null || true)
   pcount=$(tmux list-panes -t "$cwin" -F x | grep -c . || true)
   if [ "$pcount" -le 1 ]; then
     # The window already holds ONLY the keeper (keep/pick pressed again in an
@@ -1578,6 +1717,7 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   [ -n "$prompt_log" ] && tmux set-option -w -t "$nwin" @cockpit_prompt_log "$prompt_log"
   [ -n "$score_round" ] && tmux set-option -w -t "$nwin" @cockpit_score_round "$score_round"
   [ -n "$base" ]   && tmux set-option -w -t "$nwin" @cockpit_base "$base"
+  [ -n "$from_wt" ] && tmux set-option -w -t "$nwin" @cockpit_from_worktree "$from_wt"
   _style_window "$nwin"
   local l
   for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
@@ -1591,6 +1731,26 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   # killing the grid kills that pane — and this very process with it. Nothing
   # after this line is guaranteed to execute.
   [ "$nwin" = "$cwin" ] || tmux kill-window -t "$cwin" 2>/dev/null || true
+}
+
+# Abort when the round's base branch is not the branch `workmux merge` would
+# merge into and the caller hasn't chosen one explicitly. $1 = round base,
+# $2 = winner, $3.. = the merge flags already collected.
+_require_merge_target(){
+  local cwin="$1" base="$2" winner="$3"; shift 3
+  local main a
+  for a in "$@"; do [ "$a" = "--into" ] && return 0; done
+  # Only rounds started from a linked worktree are ambiguous — _run_round stamps
+  # the flag. A FORK's base is a throwaway round branch whose commits reach main
+  # through the winner anyway, so it needs no prompt.
+  [ "$(tmux show-options -wqv -t "$cwin" @cockpit_from_worktree 2>/dev/null || true)" = 1 ] || return 0
+  main=$(_workmux_main_branch); [ -n "$main" ] || main=main
+  git show-ref --verify --quiet "refs/heads/$base" 2>/dev/null || return 0
+  [ "$base" != "$main" ] || return 0
+  say "this round branched from '$base', but 'workmux merge' targets '$main'."
+  say "  merge onto the branch you started from:  wtcp pick $winner --into $base"
+  say "  or merge into the main branch anyway:    wtcp pick $winner --into $main"
+  die "ambiguous merge target — nothing merged, the grid is untouched."
 }
 
 cmd_keep_menu(){ need_tmux; _keep_menu "$(_cur_win)"; }
@@ -1663,6 +1823,11 @@ cmd_pick(){
     _keep_session "$cwin" "$winner" "${losers[@]:-}"
     return 0
   fi
+  # `workmux merge` always targets main_branch unless --into says otherwise. When
+  # the round was branched from some OTHER branch (started inside a linked
+  # worktree, or after a fork), merging to main silently skips that branch — so
+  # make the user say which one they mean instead of guessing.
+  _require_merge_target "$cwin" "$base" "$winner" ${mergeargs[@]+"${mergeargs[@]}"}
   say "winner [$winner] -> merge${mergeargs[0]:+ (${mergeargs[*]})} to workmux main branch / cleanup: ${losers[*]:-(none)}"
   _wm merge "$winner" ${mergeargs[@]+"${mergeargs[@]}"} || { _merge_fail_recover "$winner"; exit 1; }
   local l; for l in "${losers[@]:-}"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
@@ -1762,6 +1927,66 @@ cmd_grid(){
 # Environment / compatibility check. Prints what wtcp depends on so you can see
 # why the grid, mouse, or per-pane scroll misbehaves on a given machine/terminal.
 # Safe to run anywhere (does not need to be inside a grid).
+# wtcp drives workmux but hardcodes several of its defaults (window names, the
+# single-agent-pane assumption, the merge target). Surface every setting that
+# diverges, because the failure mode is otherwise silent: the grid simply never
+# assembles, or the judge compares against a ref nobody branched from.
+_doctor_workmux_compat(){
+  local gcfg pcfg root v
+  gcfg=$(_workmux_cfg_global)
+  root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  pcfg="${root:+$root/.workmux.yaml}"
+  echo "  workmux config"
+  printf '    global         %s\n' "$( [ -f "$gcfg" ] && echo "$gcfg" || echo '(none)' )"
+  [ -n "$pcfg" ] && [ -f "$pcfg" ] && printf '    project        %s\n' "$pcfg"
+  [ -f "$gcfg.wtcp-bak" ] && printf '    backup         %s\n' "$gcfg.wtcp-bak"
+
+  v=$(_workmux_cfg_value main_branch)
+  printf '    main_branch    %s   (wtcp pick merges here unless --into)\n' "${v:-(unset -> workmux default)}"
+  v=$(_workmux_cfg_value base_branch)
+  if [ -n "$v" ]; then
+    printf '    base_branch    %s   — wtcp overrides it with --base <current ref> per round\n' "$v"
+  else
+    printf '    base_branch    (unset -> current branch)\n'
+  fi
+  v=$(_workmux_cfg_value window_prefix)
+  case "${v:-wm-}" in
+    wm-) printf '    window_prefix  %s\n' "${v:-wm- (default)}" ;;
+    *)   printf '    window_prefix  %s   INCOMPATIBLE: wtcp matches "<task>-<agent>" and "wm-<task>-<agent>"\n' "$v"
+         printf '                   only, so the grid will never assemble. Unset it for wtcp rounds.\n' ;;
+  esac
+  v=$(_workmux_cfg_value worktree_prefix)
+  if [ -n "$v" ]; then
+    printf '    worktree_prefix %s  INCOMPATIBLE: breaks window matching, collision detection,\n' "$v"
+    printf '                   and COCKPIT_TRUST pre-trust paths. Unset it for wtcp rounds.\n'
+  fi
+  v=$(_workmux_cfg_value worktree_naming)
+  case "$v" in
+    ''|full) : ;;
+    *) printf '    worktree_naming %s  may break "<task>-<agent>" name matching\n' "$v" ;;
+  esac
+  if { [ -f "$gcfg" ] && grep -qE '^(panes|windows):' "$gcfg"; } \
+     || { [ -n "$pcfg" ] && [ -f "$pcfg" ] && grep -qE '^(panes|windows):' "$pcfg"; }; then
+    printf '    panes/windows  CUSTOM LAYOUT — wtcp joins only the FIRST pane of each agent\n'
+    printf '                   window into the grid; the rest stay behind in their own window.\n'
+  else
+    printf "    panes/windows  default (2-pane: agent + shell) — wtcp grids the agent pane;\n"
+    printf '                   the leftover shell pane keeps its window until the round ends.\n'
+  fi
+  # Which agent entries wtcp may rewrite vs. which are the user's own.
+  local a mine="" yours=""
+  for a in $COCKPIT_AGENTS; do
+    _agent_cfg_exists "$a" || continue
+    if _agent_cfg_is_wtcp_managed "$a"; then mine="${mine:+$mine }$a"; else yours="${yours:+$yours }$a"; fi
+  done
+  [ -n "$mine" ]  && printf '    wtcp-managed   %s   (wtcp may rewrite these entries)\n' "$mine"
+  [ -n "$yours" ] && {
+    printf '    yours          %s   (hand-written; wtcp never overwrites them, so\n' "$yours"
+    printf '                   COCKPIT_AGENT_*_CMD/_MODEL for those names is ignored)\n'
+  }
+  return 0
+}
+
 cmd_doctor(){
   echo "wtcp doctor — environment check"
   echo
@@ -1845,6 +2070,8 @@ cmd_doctor(){
     printf '  status hooks     MISSING — run "workmux setup" (needed for live 🤖/💬/✅ grid status).\n'
   fi
   echo
+  _doctor_workmux_compat
+  echo
   echo "  Mouse / per-pane scroll / keys misbehaving? Detach tmux (prefix d) and"
   echo "  re-run 'wtcp start' (or 'wtcp setup'). A long-lived session can leave the"
   echo "  terminal's mouse-reporting state stale; detaching re-initializes it. This"
@@ -1881,10 +2108,11 @@ ${B}REVIEW & FINISH${O}
 
 ${B}WORKSPACE${O}
   wtcp grid             jump to the newest wtcp window                    ${D}g${O}
-  wtcp list             list active worktrees                             ${D}ls${O}
-  wtcp clean            remove ALL compare worktrees + wtcp windows       ${D}clear${O}
+  wtcp list             list active worktrees ${D}(all of workmux's, not just wtcp's)${O}  ${D}ls${O}
+  wtcp clean            remove this round's worktrees + wtcp windows      ${D}clear${O}
+  wtcp clean --all      remove EVERY workmux worktree here ${D}(asks first)${O}
   wtcp setup            (re)install in-grid keys + mouse ${D}(start does this)${O}
-  wtcp doctor           environment check: tmux/mouse/agents/deps + tips
+  wtcp doctor           environment check: tmux/mouse/agents/deps/workmux config
 
 ${B}IN-GRID KEYS${O}  ${D}press your tmux prefix first — Ctrl+letter passes the Korean IME${O}
   Ctrl-P pick·merge   Ctrl-K keep   Ctrl-X drop   Ctrl-S send-all   Ctrl-F fork   Ctrl-R review menu
@@ -1900,14 +2128,54 @@ ${B}CONFIG${O}  ~/.config/wtcp/config   ${D}(sourced shell vars — template: wt
 EOF
 }
 
+# Worktrees wtcp itself created: the @worktree stamped on every agent pane of a
+# `wt:` window (grid or kept session). This is `wtcp clean`'s scope — worktrees
+# the user made with plain `workmux add` must survive.
+_cockpit_worktrees(){
+  local w wt
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    while IFS= read -r wt; do
+      [ -n "$wt" ] && printf '%s\n' "$wt"
+    done < <(tmux list-panes -t "$w" -F '#{@worktree}' 2>/dev/null || true)
+  done < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null \
+             | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}' || true)
+  return 0
+}
+
 cmd_clean(){
   need_repo
-  say "removing all worktrees (except main) + closing grid windows..."
+  local all=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --all) all=1 ;;
+      *) die "clean: unknown option $arg (usage: wtcp clean [--all])" ;;
+    esac
+  done
   # 1) Remove worktrees FIRST. cmd_clean is often run from the grid's bottom bar
   #    pane; step 2 kills that window — which would terminate this script before
   #    the removal ran (the old "have to run clean twice" bug). Do removal first
   #    so it always completes even if killing our own window ends the script.
-  _wm remove --all -f
+  if [ "$all" -eq 1 ]; then
+    # `workmux remove --all -f` is repo-wide and ignores uncommitted changes, so
+    # it also destroys worktrees the user is working in outside wtcp. Confirm.
+    say "about to remove EVERY workmux worktree in this repo (except the main one),"
+    say "including any you created with plain 'workmux add', uncommitted changes and all."
+    local ans=""
+    read -r -p "wtcp: continue? [y/N] " ans </dev/tty 2>/dev/null || ans=n
+    case "$ans" in y|Y|yes|YES) ;; *) die "aborted (nothing removed)";; esac
+    _wm remove --all -f
+  else
+    local wts=() wt
+    while IFS= read -r wt; do [ -n "$wt" ] && wts+=("$wt"); done < <(_cockpit_worktrees)
+    if [ ${#wts[@]} -eq 0 ]; then
+      say "no wtcp round worktrees found — leaving your other workmux worktrees alone."
+      say "  ('wtcp clean --all' removes every workmux worktree in this repo.)"
+    else
+      say "removing wtcp round worktrees + closing grid windows: ${wts[*]}"
+      for wt in "${wts[@]}"; do _wm remove "$wt" -f || true; done
+    fi
+  fi
   # 2) Close any leftover grid windows (their joined panes aren't workmux-tracked
   #    so `remove` can't close them). Kill the window we're in LAST.
   local w cur; cur=$(_cur_win 2>/dev/null || true)

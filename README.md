@@ -1,13 +1,8 @@
 # Worktree Cockpit (`wtcp`)
 
+**A multi-agent comparison layer on top of [workmux](https://github.com/raine/workmux).**
 Run several coding agents on **one prompt** in an isolated tmux grid, then
 review, score, and merge the best — all from a few keystrokes.
-
-`wtcp` is a thin orchestrator over [workmux](https://github.com/raine/workmux) + tmux + git:
-it branches a git worktree per agent, broadcasts your prompt to all of them,
-tiles them into a grid with a command bar, and gives you in-grid keys to score
-the results with your judge LLM and merge the winner into your configured
-workmux main branch.
 
 ```
 ┌──────────────┬──────────────┬──────────────┐
@@ -18,20 +13,50 @@ workmux main branch.
 └─────────────────────────────────────────────┘
 ```
 
+## wtcp is workmux, fanned out
+
+workmux already does the hard part: one command gives you a git worktree, a
+tmux window, and a coding agent running in it, plus a clean `merge` that folds
+the branch back and tears the worktree down. wtcp does not reimplement any of
+that — **every worktree, branch, agent launch, status icon, and merge below is
+workmux doing its job.** `wtcp` is the layer that runs *N of them against the
+same prompt* and helps you choose:
+
+| Layer | Owns |
+|-------|------|
+| **workmux** | worktrees + branches, tmux windows, launching/prompting each agent, agent status tracking, `merge` / `remove` / base + main branch policy |
+| **wtcp** | one prompt → N agents at once, joining their panes into a scored grid, an LLM judge that ranks them head-to-head, and one keystroke to merge the winner and drop the rest |
+
+So everything you know about workmux keeps working, and anything workmux
+configures (`main_branch`, `base_branch`, agent profiles, hooks) is policy wtcp
+follows rather than overrides. If you also drive workmux by hand in the same
+repo, read
+[Using wtcp alongside plain workmux](#using-wtcp-alongside-plain-workmux) — wtcp
+deliberately keeps to its own lane there.
+
+**If you don't use workmux yet, start there.** wtcp only pays off once running
+one agent in a worktree is already routine for you.
+
 ## Requirements
 
-**Core tools** — `tmux`, `git`, `jq`, `curl` (usually preinstalled or one `brew`/
-`apt` away), plus [**workmux**](https://github.com/raine/workmux), the worktree
-manager wtcp drives:
+**[workmux](https://github.com/raine/workmux)** — the engine wtcp drives, not an
+optional integration. Install and set it up first, alongside `tmux`, `git`,
+`jq`, and `curl` (usually preinstalled or one `brew`/`apt` away):
 
 ```sh
 brew install raine/workmux/workmux      # macOS / Linuxbrew
+workmux setup                           # once: installs the agent status hooks
 ```
 
-**Agent CLIs** — install and **log in to** the ones you want to compare; wtcp only
-launches them. Builtins workmux knows: `claude`, `codex`, `opencode`, `gemini`.
-Others (e.g. `agy` / Antigravity) are auto-configured by wtcp. Each agent must
-already be authenticated on your machine.
+`workmux setup` is not optional decoration — the grid's live 🤖/💬/✅ pane
+badges are read straight out of workmux's per-agent state files, so without the
+hooks the borders stay blank. `wtcp doctor` tells you if they're missing.
+
+**Agent CLIs** — install and **log in to** the ones you want to compare; neither
+workmux nor wtcp authenticates them, they only launch them. An "agent" here is a
+workmux agent name: the builtins workmux knows (`claude`, `codex`, `opencode`,
+`gemini`) or any profile in your `~/.config/workmux/config.yaml`. Others (e.g.
+`agy` / Antigravity) are auto-configured by wtcp.
 
 **A judge LLM endpoint** — required only for `wtcp score`. Use any
 OpenAI-compatible `/chat/completions` endpoint you already run, local or hosted.
@@ -55,21 +80,27 @@ cp wtcp.config.example ~/.config/wtcp/config
 $EDITOR ~/.config/wtcp/config
 ```
 
-At minimum, set `COCKPIT_AGENTS` to agent CLIs that are installed and logged in
-on your machine. Set the judge endpoint fields when you want `wtcp score`.
+At minimum, set `COCKPIT_AGENTS` to workmux agent names whose CLIs are installed
+and logged in on your machine. Set the judge endpoint fields when you want
+`wtcp score`.
 
 ## Quick start
 
-Run wtcp from the repository you want agents to edit, inside tmux:
+Run wtcp from the repository you want agents to edit, inside tmux — the same
+place you'd run `workmux add`:
 
 ```sh
 cd /path/to/your/git-repo
 tmux new -s wtcp
 
-wtcp doctor                 # check tmux, workmux, deps, and configured agents
+wtcp doctor                 # tmux, workmux config fit, deps, configured agents
 wtcp agents codex claude    # use only agents installed + logged in on this machine
 wtcp start "add a CONTRIBUTING.md"
 ```
+
+`wtcp start` is `workmux add` repeated once per agent — same worktrees, same
+branches, same prompt injection — with the resulting panes gathered into one
+grid instead of scattered across windows.
 
 Once the grid opens, review the panes. If a judge endpoint is configured, use
 `prefix Ctrl-R` to open the review menu: run the LLM judge, **merge the scored
@@ -157,8 +188,11 @@ no merge), `wtcp fork "..."` (new round from a pane's WIP), `wtcp winner`
 focused pane's agent, or a menu; rendered with [delta](https://github.com/dandavison/delta)
 when installed), `wtcp show` (last judge report), `wtcp copy` (copy last judge
 report), `wtcp abandon` (discard the current grid without merging), `wtcp grid`,
-`wtcp list`, `wtcp clean`, `wtcp doctor` (environment check). Run `wtcp help`
-for the full list.
+`wtcp list`, `wtcp clean` (this round's worktrees; `--all` for every workmux
+worktree in the repo), `wtcp doctor` (environment check). Run `wtcp help`
+for the full list. See
+[Using wtcp alongside plain workmux](#using-wtcp-alongside-plain-workmux) when
+you also drive workmux by hand.
 
 ### What commands change
 
@@ -170,7 +204,52 @@ for the full list.
 | `wtcp drop` | removes only the focused agent's worktree/pane |
 | `wtcp fork` | commits the focused pane's WIP as a base and starts another round from it |
 | `wtcp abandon` | removes the current grid's worktrees without merging anything |
-| `wtcp clean` | removes all compare worktrees and closes wtcp grid windows (kept sessions included) |
+| `wtcp clean` | removes **this round's** worktrees and closes wtcp grid windows (kept sessions included); worktrees you created with plain `workmux add` are left alone |
+| `wtcp clean --all` | removes **every** workmux worktree in the repo, uncommitted changes and all — asks for confirmation first |
+
+## Using wtcp alongside plain workmux
+
+wtcp drives workmux, so both read the same config and can share a repo and a
+tmux session. wtcp keeps to its own lane:
+
+- **Destructive commands are scoped.** `wtcp clean`, `pick`, `keep`, and
+  `abandon` only touch worktrees wtcp created for the round. Use
+  `wtcp clean --all` (which confirms first) for the repo-wide sweep — that one
+  *does* remove worktrees you made yourself. `wtcp list` is a plain passthrough
+  to `workmux list`, so it still shows everything.
+- **Your workmux agent entries are never overwritten.** wtcp writes launch
+  commands into `~/.config/workmux/config.yaml` for agents it manages, marking
+  them `# wtcp-managed`, and backs the file up to `config.yaml.wtcp-bak` before
+  its first change. An entry you wrote by hand — especially a multi-line
+  `type:`/`command:`/`args:`/`env:` block — is left exactly as-is, and wtcp
+  tells you that its `COCKPIT_AGENT_*_CMD`/`_MODEL` for that name is being
+  ignored. To hand an entry over to wtcp, delete it or append `# wtcp-managed`.
+- **Branch policy comes from workmux.** Each round is branched with an explicit
+  `--base` (the ref you're standing on), and the judge diffs against that same
+  ref, so a `base_branch:` in your workmux config can't make the two disagree.
+  Where wtcp has to guess a base it uses your `main_branch` before falling back
+  to `main`/`master`.
+- **Starting a round inside another worktree.** This is allowed, but
+  `workmux merge` always targets `main_branch` — so the winner would land on
+  main rather than the branch you're on. wtcp warns when the round starts and
+  then makes `wtcp pick` ask for an explicit `--into <branch>` instead of
+  merging somewhere you didn't mean.
+- **During a round, use wtcp's commands.** Agent panes are joined into the grid
+  window, so workmux's `send`/`capture`/`run` can no longer find them by window
+  name; `wtcp send` and the in-grid keys are the equivalents. `workmux
+  dashboard`/`sidebar` keep working — they read the per-pane state files, which
+  is also where the grid's 🤖/💬/✅ icons come from.
+- **`wtcp doctor` reports the fit.** It prints your `main_branch`,
+  `base_branch`, and flags settings wtcp can't follow — a custom
+  `window_prefix`/`worktree_prefix` (the grid silently never assembles), a
+  custom `panes:`/`windows:` layout (wtcp grids only the first pane of each
+  agent window), and which agent entries are yours versus wtcp's.
+
+One thing wtcp does **not** survive: a tmux server restart. Round state lives in
+tmux window options, so `workmux resurrect` brings the worktrees' windows back
+but not the grid — score/pick/diff won't work in it. Merge or `keep` what you
+want before restarting tmux; otherwise re-run the round, or `wtcp clean --all`
+to clear the leftovers.
 
 ## Analysis rounds — keep a session instead of merging
 
