@@ -70,10 +70,14 @@ COCKPIT_JUDGE_MODEL=""
 COCKPIT_JUDGE_AUTH=""
 
 # How much context the judge sees. `wtcp score` compares ALL agents in one call;
-# COMPARE_CHARS is the total evidence budget split across them. OUTPUT/DIFF_CHARS
-# bound a single agent. PROMPT_LOG_CHARS bounds the initial+follow-up instruction
-# timeline. Raise for a bigger-context judge, lower for a small local one
-# (char ~ 1/3-1/4 token; keep the total under the model's window).
+# COMPARE_CHARS is the target total split across agents. Each agent gets one
+# combined change+terminal pool; unused change space flows to terminal output.
+# Long terminals are sent as explicit head+tail excerpts, never a silent tail.
+# DIFF_CHARS targets one agent's complete manifest + file-balanced patch
+# excerpts; a complete file inventory and minimum new-test excerpt may exceed
+# it slightly rather than being silently omitted. PROMPT_LOG_CHARS bounds the
+# instruction timeline. Raise for a bigger-context judge, lower for a small
+# local one (char ~ 1/3-1/4 token; keep the total under the model's window).
 COCKPIT_JUDGE_OUTPUT_CHARS=16000
 COCKPIT_JUDGE_DIFF_CHARS=16000
 COCKPIT_JUDGE_COMPARE_CHARS=48000

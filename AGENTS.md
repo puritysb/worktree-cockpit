@@ -53,8 +53,11 @@ This file is the design/gotcha memory for working ON wtcp itself.
   with no workmux state (shell/bar/empty pad) get no icon. The same watcher
   re-tiles on a pane-set change so sub-panes an agent spawns (Claude Code's
   tmux teammate mode) stay visible — see `_retile_with_teammates`.
-- `prefix Ctrl-R` opens a `display-menu` (run judge / merge-winner / pick-winner
-  menu / keep / view-diff / show / copy). After scoring — and via `wtcp winner` /
+- `prefix Ctrl-R` opens a `display-menu` (run judge / run fresh judge /
+  merge-winner / pick-winner menu / keep / view-diff / show / copy).
+  `wtcp score --fresh` omits previous pane scores/reasons so a corrected
+  evidence pipeline can re-evaluate the CURRENT round without anchoring or
+  restarting agents. After scoring — and via `wtcp winner` /
   the menu's "pick winner" —
   `_winner_menu` reads the ★scores stamped on each pane border (via `_scored_rows`:
   unjudged `★ ?` panes get sort key −1 so they land LAST — `?` is text and would
@@ -64,12 +67,64 @@ This file is the design/gotcha memory for working ON wtcp itself.
   worktree name, not pane focus, so an explicit winner still drops the rest.
   Menus (`_agent_menu`) /`display-menu` no-op without an attached client (headless tests).
 - `wtcp diff [wt]` shows an agent's FULL diff vs `@cockpit_base` in a popup
-  (`_show_diff_popup`): the judge reads a capped diff (`_wt_diff` = `_wt_diff_raw`
-  piped through `head -c $COCKPIT_JUDGE_DIFF_CHARS`), the viewer reads the uncapped
-  `_wt_diff_raw`. Renders via `delta` when on PATH (force `DELTA_PAGER='less -R'` —
+  (`_show_diff_popup`): the judge reads `_wt_evidence`, which puts status, the
+  complete tracked/untracked file list + numstat, changed-test import signals,
+  and explicit truncation accounting before file-balanced patch excerpts
+  (new tests first); the viewer reads the uncapped `_wt_diff_raw`. Renders via
+  `delta` when on PATH (force `DELTA_PAGER='less -R'` —
   delta's default pager includes `-F`, the popup flash-close gotcha) else
   `git diff --color=always` + `less -R`. Writes `~/.config/wtcp/diff.txt` even
   headless (the test observable).
+- Judge terminal evidence uses `_terminal_evidence`, not a raw `tail -c`.
+  Comparative scoring gives each candidate one combined pool; unused change
+  evidence budget flows to terminal evidence. Long scrollback is trailing-blank
+  trimmed and packaged as explicit head + tail with total/delivered counts.
+  This matters most for read-only analysis rounds, where terminal output is the
+  deliverable and a longer report must not lose its opening while shorter peers
+  remain complete.
+- The judge rubric has ONE source, `_judge_rubric`: Task 0–4 + Grounding 0–3 +
+  Verification 0–2 + Actionability 0–1. The model does NOT own the redundant
+  final-score arithmetic: `_rubric_response_normalize` validates dimensions,
+  candidate names/winner, and cap IDs, ignores any model-emitted `score`,
+  computes score from the breakdown, and deterministically lowers relevant
+  dimensions to enforce declared caps. `_rubric_response_valid` is its
+  no-output wrapper. Never reintroduce a required model-computed score: Qwen
+  repeatedly returned valid breakdowns with an off-by-one score and copied the
+  same mismatch in a repair turn. Every record must include `evidence_level`
+  (`direct|mixed|narrative_only`) and four `dimension_reasons`. Normalization
+  adds `mixed_primary_evidence` (Grounding ≤2, total ≤9) or
+  `narrative_only_evidence` (Grounding ≤1, total ≤8), requires the named winner
+  to have a top absolute score, and sorts rankings by computed score. The prompt
+  keeps dimensions orthogonal: a comparative-only weakness is not an absolute
+  deduction, unverified facts do not lower Task, optional next-step offers are
+  not scope failures, the stored timeline alone defines requirements, and one
+  issue must not be charged twice. Feedback is structured as
+  `strength`/`deduction`/`improve_dimension`/`improve`; normalization rejects
+  an improvement aimed at a full-credit dimension (and requires a real target
+  below 10) or `Deduction: None` below 10. Every dimension has a snake-case
+  `dimension_issue_id`. Normalization clears IDs on full-credit dimensions and
+  namespaces a declared hard-cap ID when it affects several dimensions;
+  remaining duplicate non-cap IDs across deducted dimensions are rejected so
+  one issue cannot be charged twice. Evidence/verification/comparison-only
+  Task deductions are removed deterministically, with the adjustment exposed
+  in the report; evidence-level caps also synthesize a missing Grounding issue
+  ID, and declared hard-cap ID variants are namespaced per dimension.
+  Comparative JSON also requires
+  `winner_reason`, `tie_break`, and neutral `summary`. If normalization creates
+  a top-score tie after the response, `none`/`not_needed` becomes an explicit
+  judge-preference tie-break; an exact duplicate summary is omitted from the
+  report.
+  Judge response tokens scale per candidate.
+  A schema failure gets exactly one format-only retry (`_judge_repair_request`,
+  temperature 0, same evidence/substantive judgment); a second failure records
+  both model responses in `~/.config/wtcp/judge-invalid.txt` before comparative
+  scoring falls back to independent judging. Independent judging uses the same
+  one-repair rule, so never replace strict validation with permissive parsing.
+  Reports and `@judge_reason` expose both the breakdown and applied `Caps`.
+  `_wt_evidence` supplies a repository identity hard-gate profile
+  (canonical common-git-dir repo name, package, worktree/HEAD, tracked/test
+  counts, complete top-level tracked entries). Wrong-repository analysis gets
+  Grounding 0 and total ≤2; never reward its detailed-looking paths or counts.
 - `cmd_pick` branches on the diff: a winner WITH changes vs `@cockpit_base` merges
   as usual; a winner with NO changes (analysis/research round) is handed to
   `_keep_session` instead — `workmux merge` errors on an empty branch, and the
@@ -179,10 +234,10 @@ This file is the design/gotcha memory for working ON wtcp itself.
    (Same family as gotcha 8 / cmd_clean's remove-before-kill ordering.)
 13. **`capture-pane -p` pads the viewport with trailing blank lines.** Sampling
    "the last N lines" therefore hashes constant blanks while the real content
-   changes further up. wtcp's status watcher USED to hash the whole captured
-   pane to dodge this; it now reads workmux's per-pane state files directly
-   (`_workmux_pane_status` / `cmd_status_watch`), so the trap no longer
-   applies — remember it only if you reintroduce capture-pane hashing.
+   changes further up. The status watcher reads workmux state files directly;
+   judge output goes through `_terminal_evidence`, which trims trailing blank
+   rows and preserves head + tail when capped. Do not reintroduce raw tail/hash
+   sampling.
 14. **tmux mangles non-ASCII option values to `_` ON READ when the reading
    client's locale is not UTF-8** (storage keeps the raw bytes; verified by
    matrix test). All ★/🏆/🤖/💬/✅ parsing (`_scored_rows`, `_scored_winner`,
@@ -216,10 +271,12 @@ This file is the design/gotcha memory for working ON wtcp itself.
    `base_branch`, an incompatible `window_prefix`/`worktree_prefix`, a custom
    `panes:`/`windows:` layout, and which agent entries are wtcp's vs the user's.
 17. **Base branch and merge target come from workmux, not from wtcp's guesses.**
-   `_run_round` now ALWAYS passes `--base "$round_base"`. Without it workmux
-   branches from its configured `base_branch` while wtcp stamps the current ref
-   as `@cockpit_base` — the judge then diffs against a ref nobody branched
-   from, and `cmd_pick`'s has-changes test picks merge-vs-keep wrongly.
+   `_run_round` resolves `round_base` to a commit SHA at launch, ALWAYS passes
+   that SHA via `--base`, and stamps the same immutable SHA as `@cockpit_base`.
+   A moving `main`/`master` must never alter an active round's evidence. Without
+   explicit `--base`, workmux branches from its configured `base_branch` while
+   wtcp may record a different ref — corrupting judge diffs and `cmd_pick`'s
+   merge-vs-keep decision.
    `_diff_base` falls back to workmux's `main_branch` before guessing
    `main`/`master`. Starting a round inside a LINKED worktree is ambiguous
    (`workmux merge` always targets `main_branch`, not the branch you're on), so
@@ -245,6 +302,10 @@ This file is the design/gotcha memory for working ON wtcp itself.
    by `@worktree`, so teammate panes are naturally skipped — they're never fed
    to the LLM judge and never show ★ scores. Teammates DO get 🤖/💬/✅ from
    workmux's status hooks (they're real agent processes), which is desirable.
+19. **Popup text input must use Readline, not terminal canonical editing.**
+   Plain `read` makes arrow keys literal escape bytes and can corrupt multibyte
+   Korean text when editing. `_read_editable_line` uses `read -e`; send/fork
+   popup prompts advertise `Ctrl-C` cancel, and empty Enter cancels cleanly.
 
 ## Design decisions (evaluated & rejected — don't re-litigate)
 
@@ -284,14 +345,19 @@ Fast unit-style regression tests (no real agents/tmux/workmux pollution) live
 under `tests/`. Run them after touching `_workmux_pane_status`,
 `_retile_with_teammates`, `cmd_status_watch`, or `_apply_grid_layout` (first
 file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
-`_in_linked_worktree` (second):
+`_in_linked_worktree` (second), or `_round_base_commit`, `_wt_evidence`,
+`_wt_file_patch`, `_terminal_evidence`, `_judge_rubric`,
+`_rubric_response_valid`, judge budgets/prompts (third), or popup
+send/fork input editing (fourth):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
-bash tests/test_workmux_coexist.sh   # 29 assertions; also a throwaway git repo
+bash tests/test_workmux_coexist.sh   # 32 assertions; also a throwaway git repo
+bash tests/test_judge_evidence.sh    # 114 assertions; immutable base + rubric/evidence/repair
+bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 
-Both extract functions straight out of `wtcp` with `extract_fn` (an awk range
+These tests extract functions straight out of `wtcp` with `extract_fn` (an awk range
 from `name()` to the closing `}` in column 1) rather than sourcing the script,
 so a helper they cover must keep its brace on its own line.
 

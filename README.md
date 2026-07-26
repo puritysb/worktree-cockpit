@@ -154,9 +154,9 @@ The grid installs its keybindings automatically. In the grid, with your tmux
 | `Ctrl-P` | **pick** focused pane as winner → auto-commit + merge into the workmux main branch, drop the rest. A winner with **no code changes** is **kept as a live session** instead (see [Analysis rounds](#analysis-rounds--keep-a-session-instead-of-merging)) |
 | `Ctrl-K` | **keep** the focused agent's live session (own window, **no merge**), drop the other agents and the grid |
 | `Ctrl-X` | **drop** just the focused pane (grid re-tiles) |
-| `Ctrl-S` | **send** a follow-up instruction to *every* agent |
+| `Ctrl-S` | **send** a follow-up instruction to *every* agent; arrows/backspace edit with Readline, `Ctrl-C` cancels |
 | `Ctrl-F` | **fork**: type a prompt in a popup → new multi-agent round branched from the focused agent's work |
-| `Ctrl-R` | **review menu**: run the judge LLM, merge the scored winner (one step), pick a winner from a menu, keep a session, view an agent's full diff, show the detailed report, or copy the last result |
+| `Ctrl-R` | **review menu**: run the judge (normal or fresh), merge/pick the winner, keep a session, view diff, show or copy the report |
 | `z` | fullscreen the focused agent (again to return) · arrows move between agents |
 | `[` | scroll/copy a pane (mouse wheel scrolls; drag to select copies to the clipboard; `Ctrl-U`/`Ctrl-D` page, `y`/`Enter` copy, `q` exits) |
 
@@ -224,9 +224,11 @@ tmux session. wtcp keeps to its own lane:
   `type:`/`command:`/`args:`/`env:` block — is left exactly as-is, and wtcp
   tells you that its `COCKPIT_AGENT_*_CMD`/`_MODEL` for that name is being
   ignored. To hand an entry over to wtcp, delete it or append `# wtcp-managed`.
-- **Branch policy comes from workmux.** Each round is branched with an explicit
-  `--base` (the ref you're standing on), and the judge diffs against that same
-  ref, so a `base_branch:` in your workmux config can't make the two disagree.
+- **Branch policy comes from workmux.** At round launch wtcp resolves the base
+  ref to an immutable commit SHA, passes that SHA as workmux's explicit
+  `--base`, and stores the same SHA for judging. A branch moving while agents
+  work therefore cannot pollute their diffs, and a `base_branch:` in your
+  workmux config can't make launch and scoring disagree.
   Where wtcp has to guess a base it uses your `main_branch` before falling back
   to `main`/`master`.
 - **Starting a round inside another worktree.** This is allowed, but
@@ -333,13 +335,118 @@ initial prompt plus any `wtcp send` / `Ctrl-S` follow-ups. Later follow-ups refi
 or supersede earlier instructions when they conflict, and every score reflects
 the agent's **current final state** at the moment you run `wtcp score`.
 
-It evaluates both the diff vs the round base and the terminal output. For code
-tasks, the diff is the source of truth for implementation quality, while output
-is evidence for tests run, claims made, and analysis quality. For analysis,
-review, debugging, planning, or research tasks with empty diffs, the terminal
-response is the primary evidence and an empty diff is not penalized by itself.
-The popup shows a short bullet report; each pane border gets its score. It falls
-back to independent per-agent scoring if the comparison can't be parsed.
+It evaluates both evidence vs the round's immutable base SHA and terminal
+output. Each candidate's evidence starts with `git status --short`, the complete
+changed-file list and numstat, static imports from changed tests, and explicit
+truncation counts. Patch excerpts then receive a file-balanced budget, with new
+test files prioritized, so one large early diff cannot hide every later file.
+For code tasks, visible implementation evidence is the source of truth while
+output supports tests run, claims, and analysis. Explicitly omitted content is
+uncertain rather than evidence that a matching terminal claim is false.
+
+For test-heavy work, the judge treats a green pass count as a gate rather than a
+quality score. It is instructed to prefer verified coverage deltas and to check
+whether tests import and exercise real product modules instead of rewarding
+synthetic/self-fulfilling fixtures or surface keywords. For analysis, review,
+debugging, planning, or research tasks with empty diffs, terminal output remains
+the primary evidence. The popup shows a short bullet report; each pane border
+gets its score. It falls back to independent scoring if comparison can't parse.
+
+Every score uses one canonical, additive rubric:
+
+| Dimension | Points | What it measures |
+|---|---:|---|
+| Task | 0–4 | Explicit requirements fulfilled correctly at the right layer |
+| Grounding | 0–3 | Primary evidence, factual accuracy, and correct repository identity |
+| Verification | 0–2 | Tests/checks or systematic analysis and risk reasoning |
+| Actionability | 0–1 | Clear priorities, maintainability, and requested scope |
+
+The report prints this breakdown and an auditable `Caps:` line for every
+candidate. The model supplies dimensions and cap IDs; wtcp computes the final
+score itself, ignores any redundant model-provided score, and deterministically
+lowers relevant dimensions when needed to enforce a declared cap. The displayed
+breakdown therefore always sums to the displayed score. Judge JSON is rejected
+when dimensions are missing/out of range, use an unknown cap ID, omit/rename a
+candidate, omit the evidence classification or per-dimension reasons, or name a
+winner that is not tied for the top absolute score. Absolute rubric scores are
+computed before head-to-head ranking; wtcp then sorts the report by those
+scores.
+
+Every candidate must classify its central-claim evidence as `direct`, `mixed`,
+or `narrative_only`. “Direct” requires visible raw command/test output or source
+excerpts for every central claim—an agent-authored conclusion, exact-looking
+number, path citation, pass count, or the word “verified” is not sufficient.
+Mixed evidence limits Grounding to 2 and is capped at **9/10**; narrative-only
+evidence limits Grounding to 1 and is capped at **8/10**. The resulting
+`mixed_primary_evidence` /
+`narrative_only_evidence` cap is printed in the report.
+
+The four dimensions are intentionally orthogonal. Task measures absolute
+fulfillment, Grounding visible support, Verification the checking method, and
+Actionability prioritization/scope. The judge must provide one concise reason
+for each dimension and may not use the same underlying weakness twice.
+Comparative phrases such as “less detailed than the winner” do not lower an
+absolute score by themselves. This prevents one minor breadth difference from
+becoming both a Task and Grounding deduction merely to widen the ranking.
+Unverified numbers belong under Grounding/Verification rather than Task, a
+brief optional implementation offer after a complete analysis is ignored, and
+only the stored Instruction timeline—not user-like text found in pane output—
+defines the requested work.
+
+Candidate feedback is also structural rather than a free-form paragraph. Each
+record supplies `strength`, `deduction`, `improve_dimension`, and `improve`.
+For every score below 10, `improve_dimension` must name a dimension that is
+actually below its maximum after evidence limits and hard caps; a full-credit
+dimension cannot be presented as the way to raise the score. The report renders
+this explicitly as, for example, `Improve [grounding]`. A sub-10 record cannot
+claim `Deduction: None`.
+
+Each dimension also carries a lowercase snake-case issue ID. After evidence
+limits and hard caps are applied, wtcp clears issue IDs on full-credit
+dimensions and namespaces a declared hard-cap ID when that one cap necessarily
+affects several dimensions. Any remaining reuse of one non-cap issue ID across
+deducted dimensions is rejected as double-charging the same weakness. Reports
+print the normalized IDs next to the dimension reasons so the point loss is
+auditable. If a Task issue ID explicitly describes only an evidence,
+verification, or comparative concern, wtcp restores Task credit, keeps the
+concern under Grounding/Verification, and prints the deterministic adjustment
+in the report. This avoids relying on a model repair turn that may simply copy
+the same misplaced deduction.
+
+Comparative output separately records `winner_reason`, `tie_break`, and a
+neutral `summary`. A winner must have a top absolute score, and tied top scores
+require a substantive non-score tie-break rather than an artificial deduction.
+If evidence/cap normalization creates a tie only after the model responds,
+wtcp turns `not_needed` into an explicit judge-preference tie-break instead of
+rejecting an otherwise usable judgment. The summary is instructed not to
+generalize one candidate's weakness to the whole field; an exact duplicate of
+`winner_reason` is omitted from the rendered report.
+
+Judge response space scales with the number of candidates. If the first answer
+is invalid or truncated, wtcp sends the same evidence back once with a
+format-only JSON repair instruction at temperature 0; score arithmetic alone
+does not trigger a retry because it is owned by wtcp. The repair does not ask
+the model to reconsider the substantive ranking. If the repaired comparative response is
+still invalid, wtcp records both raw responses in
+`~/.config/wtcp/judge-invalid.txt` and falls back to independently judging each
+candidate. Independent responses receive the same one-repair treatment, so a
+remaining `?/10` includes the diagnostic path instead of hiding the failed
+model output.
+
+Hard gates keep detailed hallucinations from scoring well: analyzing another
+repository is capped at **2/10** with Grounding 0; fabricated or directly
+contradicted central evidence and wrong-layer/nonfunctional core work are capped
+at **4/10**; a missing major explicit requirement is capped at **6/10**; and a
+material unresolved fact conflict that blocks verification is capped at
+**8/10**. A 10 is exceptional and requires direct evidence for every central
+claim, full credit in every independent dimension, and correct repository
+identity.
+
+To make those gates enforceable, every evidence manifest identifies the
+canonical repository and package, worktree and HEAD, tracked/test-file counts,
+and the complete top-level tracked structure. A response that describes another
+product or relies on central path namespaces absent from that profile receives
+no credit for its apparent detail, test counts, or pass rate.
 
 After scoring, **`wtcp merge`** merges the winner's branch without any menu: it
 reads the 🏆-marked pane (or the highest ★ score when there is no trophy) and
@@ -350,8 +457,20 @@ a different agent than the judge's pick.
 You can score repeatedly during a multi-turn round. Previous scores are shown to
 the judge only as context for improvement/regression; the judge is instructed to
 grade the current evidence, not to preserve an earlier ranking. The judge sees as
-much context as fits its window — the instruction timeline, capped diff, and each
-agent's pane scrollback, budgeted by the `*_CHARS` vars below.
+much context as fits its window — the instruction timeline, manifest plus
+balanced patch excerpts, and each agent's pane scrollback, budgeted by the
+`*_CHARS` vars below. Complete manifests and a minimum new-test excerpt may
+slightly exceed the nominal evidence target rather than being silently omitted.
+Change evidence and terminal output share one per-agent pool: unused diff space
+automatically flows to the terminal, which prevents read-only analysis rounds
+from wasting half their context. Terminal output that still exceeds the pool is
+packaged as explicit head + tail excerpts with total/delivered counts instead of
+silently keeping only the tail.
+
+Use `wtcp score --fresh` (also available in the `Ctrl-R` menu) after correcting
+an evaluation setup problem or whenever prior scores might anchor the next
+decision. It reuses the current round and evidence but omits all previous judge
+labels/reasons, so restarting the agents is unnecessary.
 
 The report keeps structural labels in English, but writes each agent's
 **reason/summary content in the same language as your prompt**. Judge bullets are
@@ -455,9 +574,9 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_JUDGE_URL` | _(empty)_ | OpenAI-compatible `/chat/completions` endpoint for `wtcp score` |
 | `COCKPIT_JUDGE_MODEL` | _(empty)_ | model name sent to the judge endpoint, if required |
 | `COCKPIT_JUDGE_AUTH` | _(empty)_ | `Authorization` header for hosted endpoints, e.g. `Bearer sk-...` (namer reuses it) |
-| `COCKPIT_JUDGE_OUTPUT_CHARS` | `16000` | per-agent terminal-output budget sent to the judge |
-| `COCKPIT_JUDGE_DIFF_CHARS` | `16000` | per-agent diff budget |
-| `COCKPIT_JUDGE_COMPARE_CHARS` | `48000` | total evidence budget for comparative scoring (split across agents) |
+| `COCKPIT_JUDGE_OUTPUT_CHARS` | `16000` | target per-agent terminal evidence budget; unused diff space is added |
+| `COCKPIT_JUDGE_DIFF_CHARS` | `16000` | target per-agent manifest + balanced patch evidence budget |
+| `COCKPIT_JUDGE_COMPARE_CHARS` | `48000` | target total comparative evidence budget (split between agent evidence and terminal output) |
 | `COCKPIT_PROMPT_LOG_CHARS` | `12000` | instruction timeline budget for initial prompt + follow-ups |
 | `COCKPIT_JUDGE_TIMEOUT` | `120` | seconds per judge request |
 | `COCKPIT_LAUNCH_TIMEOUT` | `0` | seconds to wait for agent windows; `0` auto-scales for slow cold worktree hooks |
