@@ -31,6 +31,7 @@ extract_fn(){ # $1 = function name -> print its definition (header line ... clos
            _judge_output_budget _terminal_evidence _judge_rubric _rubric_response_normalize \
            _rubric_response_valid \
            _rubric_error_summary _judge_error_excerpt _judge_rejection_detail \
+           _json_parse_error_line _salvage_try _judge_salvage_json \
            _judge_single_max_tokens _judge_compare_max_tokens _judge_repair_request \
            _judge_invalid_file _judge_invalid_prev_file _rotate_invalid_judgments \
            _record_invalid_judgment; do
@@ -400,8 +401,10 @@ REPAIRED_REQ=$(printf '%s' "$ORIGINAL_REQ" | _judge_repair_request "$BAD_SUM" 80
 [ "$(printf '%s' "$REPAIRED_REQ" | jq -r '.temperature')" = 0 ] \
   && pass "repair is deterministic" || fail "repair is deterministic"
 has "repair delegates score calculation to wtcp" "Do NOT include score; wtcp derives it" "$REPAIRED_REQ"
-[ "$(grep -Fc '_judge_repair_request "$resp"' "$WTCOP")" = 2 ] \
+[ "$(grep -Fc '_judge_repair_request "$first_resp"' "$WTCOP")" = 2 ] \
   && pass "comparative and independent paths each retry once" || fail "comparative and independent paths each retry once"
+[ "$(grep -Fc '_judge_salvage_json' "$WTCOP")" -ge 3 ] \
+  && pass "both paths salvage before spending the retry" || fail "both paths salvage before spending the retry"
 
 OLD_HOME="$HOME"
 HOME="$TMP/home"; export HOME
@@ -429,6 +432,49 @@ has "structural rejection names every missing block" "dimension_reasons must be 
   && pass "error summary strips jq framing" || fail "error summary strips jq framing"
 # A coordinate alone is not actionable: the judge answered "line 30, column 1"
 # by resending the identical broken JSON. Quote its own bytes back at it.
+# Two malformed shapes recur at the end of a ranking record and survive being
+# pointed out — the judge resends them byte-identical, so the one repair turn
+# cannot clear them. Salvage deterministically, and only accept what parses.
+SURPLUS_BRACE='{
+"rankings": [
+{
+"name": "a",
+"score": 1
+}
+},
+{
+"name": "b",
+"score": 2
+}
+],
+"winner": "a"
+}'
+is_salvaged(){ printf '%s' "$1" | _judge_salvage_json 2>/dev/null | jq -r "$2" 2>/dev/null; }
+[ "$(is_salvaged "$SURPLUS_BRACE" '[.rankings[].name] | join(",")')" = "a,b" ] \
+  && pass "a surplus closing brace is salvaged" || fail "a surplus closing brace is salvaged"
+DUPLICATE_KEY='{
+"rankings": [
+{
+"name": "a",
+"improve": "x"
+},
+"improve": "x"
+},
+{
+"name": "b",
+"improve": "y"
+}
+],
+"winner": "a"
+}'
+[ "$(is_salvaged "$DUPLICATE_KEY" '[.rankings[].name] | join(",")')" = "a,b" ] \
+  && pass "a key re-emitted after the record closed is salvaged" || fail "a key re-emitted after the record closed is salvaged"
+VALID_ALREADY='{"rankings":[{"name":"a"}],"winner":"a"}'
+[ "$(is_salvaged "$VALID_ALREADY" '.winner')" = "a" ] \
+  && pass "valid JSON passes through untouched" || fail "valid JSON passes through untouched"
+printf '{not json at all\n[[[\n' | _judge_salvage_json >/dev/null 2>&1 \
+  && fail "unsalvageable input is refused rather than mangled" || pass "unsalvageable input is refused rather than mangled"
+
 BROKEN_LINES=$(printf 'a\nb\nc\nd\ne\nf\ng\nh\n')
 EXCERPT=$(_judge_error_excerpt "$BROKEN_LINES" "parse error: something at line 5, column 1")
 has "excerpt includes the reported line" "5: e" "$EXCERPT"
@@ -460,15 +506,35 @@ has "report exposes the cap-driven lowering" "wtcp adjusted grounding 3->2" "$(p
 CAP_NONE=$(printf '%s' "$CAP_IMPROVE" \
   | jq -c '.deduction = "None" | .improve = "None" | .improve_dimension = "none"')
 CAP_NONE_NORM=$(printf '%s' "$CAP_NONE" | _rubric_response_normalize 0)
-# Never synthesize prose: the report language is inferred by the model from the
-# instruction timeline, so an invented English sentence lands inside a Korean
-# report. Reuse the judge's own sentence about the capped dimension instead.
-[ "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.deduction')" \
-  = "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.dimension_reasons.grounding')" ] \
-  && pass "cap-induced empty deduction reuses the judge's own wording" || fail "cap-induced empty deduction reuses the judge's own wording"
+# Never manufacture a deduction. Synthesizing English drops foreign text into a
+# report whose language the model chose; reusing dimension_reasons[target] is
+# worse, because that sentence is usually praise and printed as
+# "Deduction: the central claims are directly supported". A judge that stated no
+# deduction and was then capped has nothing to report — Caps/Adjustments do.
+is_none(){ case "$(printf '%s' "$CAP_NONE_NORM" | jq -r "$1" | tr 'A-Z' 'a-z')" in none) return 0 ;; *) return 1 ;; esac; }
+is_none '.deduction' && pass "a capped record with no judge deduction shows none" || fail "a capped record with no judge deduction shows none"
+is_none '.improve' && pass "no improvement is invented for a cap" || fail "no improvement is invented for a cap"
+is_none '.improve_dimension' && pass "no dimension is blamed for a cap" || fail "no dimension is blamed for a cap"
+has "the cap is named as the reason instead" "Score limited by the applied cap" \
+  "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.normalization_notes | join(" ")')"
 case "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.deduction')" in
-  "Capped by"*|"wtcp"*) fail "wtcp never writes report prose itself" ;;
-  *) pass "wtcp never writes report prose itself" ;;
+  "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.dimension_reasons.grounding')") fail "praise is never reused as a deduction" ;;
+  *) pass "praise is never reused as a deduction" ;;
+esac
+# Copying .strength into the Task reason promoted whatever the judge praised
+# into a justification for full marks ("there are command execution records").
+case "$(printf '%s' "$NORMALIZED_TASK" | jq -r '.dimension_reasons.task')" in
+  "$(printf '%s' "$NORMALIZED_TASK" | jq -r '.strength')") fail "a removed Task deduction does not borrow the strength text" ;;
+  *) pass "a removed Task deduction does not borrow the strength text" ;;
+esac
+has "the removed Task deduction points at Adjustments" "see Adjustments" \
+  "$(printf '%s' "$NORMALIZED_TASK" | jq -r '.dimension_reasons.task')"
+# The synthesized tie-break used to quote winner_reason verbatim, printing the
+# same sentence twice in one report.
+TIE_TEXT=$(printf '%s' "$NORMALIZED_TIE" | jq -r '.tie_break')
+case "$TIE_TEXT" in
+  *"$(printf '%s' "$NORMALIZED_TIE" | jq -r '.winner_reason')"*) fail "the tie-break does not repeat the winner rationale" ;;
+  *) pass "the tie-break does not repeat the winner rationale" ;;
 esac
 # A record wtcp did NOT adjust keeps its retry: only self-inflicted mismatches heal.
 UNTOUCHED_MISMATCH=$(printf '%s' "$GOOD_SINGLE" | jq -c '.improve_dimension = "task"')

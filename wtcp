@@ -1743,7 +1743,11 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
           and (cap_derived_issue($id) | not)
         then .breakdown.task = 4
           | .dimension_issue_ids.task = "none"
-          | .dimension_reasons.task = .strength
+          # Copying .strength here promoted whatever the judge happened to
+          # praise into a Task justification — observed: "there are command
+          # execution records" standing in for full marks on Task. A structural
+          # marker is honest; Adjustments carries the removed reason.
+          | .dimension_reasons.task = "(wtcp removed this Task deduction - see Adjustments)"
           | .normalization_notes += [
               (if ($id | comparative_task_issue)
                then ("Removed comparative-only Task deduction [" + $id
@@ -1846,7 +1850,12 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
       | dedupe_issue_ids
       | note_wtcp_adjustments($raw_breakdown);
     def improvement_valid:
-      if .score == 10 then
+      # _cap_explains marks a record whose score fell below 10 purely because
+      # wtcp applied a cap after the judge answered. There is no deduction to
+      # improve on, so demanding one would only invite fabrication.
+      if (._cap_explains // false) then
+        .improve_dimension == "none"
+      elif .score == 10 then
         .improve_dimension == "none"
       elif .improve_dimension == "task" then
         .breakdown.task < 4
@@ -1860,7 +1869,8 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
         false
       end;
     def feedback_valid:
-      if .score == 10 then
+      if (._cap_explains // false) then true
+      elif .score == 10 then
         (.deduction | ascii_downcase) == "none"
         and .improve_dimension == "none"
         and (.improve | ascii_downcase) == "none"
@@ -1887,19 +1897,27 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
         . as $rec
         | (["grounding", "verification", "task", "actionability"]
            | map(select($rec.breakdown[.] < dim_max(.))) | first) as $target
-        | if $target == null then .
+        # A judge that stated no deduction and was then capped has nothing to
+        # report, and wtcp must not manufacture it. Synthesizing English drops
+        # foreign text into a Korean report; reusing dimension_reasons[target]
+        # is WORSE, because that sentence is usually praise and then prints as
+        # "Deduction: the central claims are directly supported" (observed).
+        # Leave the feedback empty — Caps and Adjustments carry the explanation.
+        | if (.deduction | ascii_downcase) == "none" or (.deduction | length) == 0 then
+            .deduction = "None" | .improve = "None" | .improve_dimension = "none"
+            | ._cap_explains = true
+            | .normalization_notes += [
+                "Score limited by the applied cap rather than by a judge deduction; no deduction is shown."
+              ]
+          elif (.improve | ascii_downcase) == "none" or (.improve | length) == 0 then
+            .improve = "None" | .improve_dimension = "none"
+            | ._cap_explains = true
+            | .normalization_notes += [
+                "The judge named no improvement for the capped dimension; its deduction is kept as written."
+              ]
+          elif $target == null then .
           else
             .improve_dimension = $target
-            # Never invent replacement prose: the report language is inferred by
-            # the model from the instruction timeline and is unknown here, so a
-            # synthesized English sentence lands in the middle of a Korean
-            # report. Reuse the judge own sentence about the capped dimension.
-            | (if (.deduction | ascii_downcase) == "none" or (.deduction | length) == 0
-               then .deduction = .dimension_reasons[$target]
-               else . end)
-            | (if (.improve | ascii_downcase) == "none" or (.improve | length) == 0
-               then .improve = .dimension_reasons[$target]
-               else . end)
             | .normalization_notes += [
                 ("Re-targeted improve_dimension to " + $target
                   + " after wtcp adjusted the breakdown.")
@@ -1934,7 +1952,8 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
       | if improvement_valid then . else error("improve_dimension \"" + .improve_dimension + "\" targets a dimension that is already at full credit; name one below-maximum dimension (task/grounding/verification/actionability), or use none only when the computed score is 10") end
       | if feedback_valid then . else error("deduction/improve must both be \"None\" when the computed score is 10 and must both be non-None otherwise; the computed score here is " + (.score | tostring)) end
       | if issue_ids_valid then . else error("every below-maximum dimension needs its own distinct non-none dimension_issue_id and every full-credit dimension needs \"none\"") end
-      | if dimension_semantics_valid then . else error("Task issue ID \"" + .dimension_issue_ids.task + "\" describes an evidence or rival-comparison concern; Task scores the answer against the instruction timeline only, so move it to Grounding/Verification or name a concrete missing requirement") end;
+      | if dimension_semantics_valid then . else error("Task issue ID \"" + .dimension_issue_ids.task + "\" describes an evidence or rival-comparison concern; Task scores the answer against the instruction timeline only, so move it to Grounding/Verification or name a concrete missing requirement") end
+      | del(._cap_explains);
     if $n == 0 then
       if structurally_valid then normalize_checked else error(structural_error) end
     else
@@ -1953,10 +1972,11 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
                 or (.tie_break | ascii_downcase) == "not_needed"
                 or (.tie_break | ascii_downcase) == "not needed"
                 or (.tie_break | ascii_downcase) == "n/a"))
-              then .tie_break = ("Top absolute scores are tied; "
+              # Embedding winner_reason here printed the identical sentence
+              # twice in one report, right under "Winner rationale".
+              then .tie_break = ("Top absolute scores are tied after normalization; "
                 + .winner
-                + " is the judge preference for this reason: "
-                + .winner_reason)
+                + " is the judge preference (see the winner rationale).")
               else .
               end
             | .rankings |= sort_by(-.score)
@@ -1977,6 +1997,41 @@ _rubric_error_summary(){   # stdin=captured stderr -> one actionable line for th
   printf '%.600s' "$line"
 }
 
+_json_parse_error_line(){   # stdin=text -> the line number jq reports, or ""
+  jq . 2>&1 >/dev/null | sed -n 's/.*at line \([0-9][0-9]*\).*/\1/p' | head -1
+}
+_salvage_try(){   # $1=text $2=depth -> repaired text on stdout
+  local text="$1" depth="$2" line cand off
+  printf '%s' "$text" | jq -e . >/dev/null 2>&1 && { printf '%s' "$text"; return 0; }
+  [ "$depth" -lt 10 ] || return 1   # a defect per record, twice over, still terminates
+  line=$(printf '%s' "$text" | _json_parse_error_line)
+  case "$line" in ''|*[!0-9]*) return 1 ;; esac
+  # jq names the line it choked on; the surplus token is either there or on the
+  # line before it. Only ever drop pure JSON punctuation or a whole "key":
+  # line — never a fragment that could carry judgment — and require the result
+  # to parse, so a wrong guess is discarded rather than silently accepted.
+  for off in 1 0; do
+    cand=$((line - off))
+    [ "$cand" -ge 1 ] || continue
+    printf '%s' "$text" | awk -v n="$cand" 'NR == n' \
+      | grep -qE '^[[:space:]]*(\{|\}|\},|\]|\],)[[:space:]]*$|^[[:space:]]*"[A-Za-z_][A-Za-z0-9_]*"[[:space:]]*:' || continue
+    _salvage_try "$(printf '%s' "$text" | awk -v n="$cand" 'NR != n')" "$((depth+1))" && return 0
+  done
+  return 1
+}
+_judge_salvage_json(){   # stdin=model response -> parseable JSON on stdout, or nothing
+  # Two malformed shapes keep recurring at the END of a ranking record: one
+  # closing brace too many, and the record's last key re-emitted after the
+  # record already closed. The judge resends both byte-identical even when it
+  # is shown the offending lines, so the one repair turn cannot clear them —
+  # the same unrepairable-clerical class as duplicate issue IDs. Salvaging
+  # costs nothing when the response is already valid, and every candidate is
+  # re-validated against the full rubric schema afterwards.
+  local raw
+  raw=$(cat)
+  [ -n "$raw" ] || return 1
+  _salvage_try "$raw" 0
+}
 _judge_error_excerpt(){   # $1=response $2=error text -> numbered lines around the failure
   # jq reports "line 30, column 1" and the model has repeatedly proved it cannot
   # act on a coordinate alone (same duplicated-key break at line 30, resent
@@ -2112,7 +2167,7 @@ EOF
 _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $6=base ref -> "score|reason|model"
   local path="$1" prompt="$2" timeline="$3" score_round="$4" pane="$5" base="${6:-}" diff out req raw resp model score reason instr lang_rule rubric_line caps_line evidence_line dimension_lines adjustments_line
   local diff_chars combined_budget out_budget max_tokens repair_req repaired_model first_resp normalized
-  local rubric_errf rubric_err="" first_err=""
+  local rubric_errf rubric_err="" first_err="" salvaged="" salvage_n=0 salvage_names="[]"
   rubric_errf=$(mktemp "${TMPDIR:-/tmp}/wtcp-rubric.XXXXXX") || rubric_errf="${TMPDIR:-/tmp}/wtcp-rubric.$$"
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   [ -n "$path" ] && diff=$(_wt_diff "$path" "$base") || diff=""
@@ -2139,12 +2194,18 @@ _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $
     first_resp="$resp"
     first_err=$(_rubric_error_summary < "$rubric_errf")
 
-    first_err=$(_judge_rejection_detail "$resp" "$first_err")
-    repair_req=$(printf '%s' "$req" | _judge_repair_request "$resp" "$max_tokens" "$first_err")
-    raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
-    repaired_model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
-    [ -z "$repaired_model" ] || model="$repaired_model"
-    resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+    # Try the deterministic salvage before spending the one repair turn: the
+    # recurring brace/duplicate-key breaks survive being pointed out.
+    salvaged=$(printf '%s' "$resp" | _judge_salvage_json 2>/dev/null || true)
+    [ -n "$salvaged" ] && resp="$salvaged"
+    if ! printf '%s' "$resp" | _rubric_response_valid "$salvage_n" "$salvage_names"; then
+      first_err=$(_judge_rejection_detail "$first_resp" "$first_err")
+      repair_req=$(printf '%s' "$req" | _judge_repair_request "$first_resp" "$max_tokens" "$first_err")
+      raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
+      repaired_model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
+      [ -z "$repaired_model" ] || model="$repaired_model"
+      resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+    fi
   fi
   if normalized=$(printf '%s' "$resp" | _rubric_response_normalize 0 2>"$rubric_errf"); then
     resp="$normalized"
@@ -2391,21 +2452,28 @@ cmd_score(){
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
   resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
 
-  local winner expected_names rubric_errf rubric_err="" first_err=""
+  local winner expected_names rubric_errf rubric_err="" first_err="" salvaged="" salvage_n salvage_names
   rubric_errf=$(mktemp "${TMPDIR:-/tmp}/wtcp-rubric.XXXXXX") || rubric_errf="${TMPDIR:-/tmp}/wtcp-rubric.$$"
   expected_names=$(printf '%s\n' "${names[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  salvage_n="$nag"; salvage_names="$expected_names"
   if normalized=$(printf '%s' "$resp" | _rubric_response_normalize "$nag" "$expected_names" 2>"$rubric_errf"); then
     resp="$normalized"
   else
     first_resp="$resp"
     first_err=$(_rubric_error_summary < "$rubric_errf")
 
-    first_err=$(_judge_rejection_detail "$resp" "$first_err")
-    repair_req=$(printf '%s' "$req" | _judge_repair_request "$resp" "$max_tokens" "$first_err")
-    raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
-    repaired_model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
-    [ -z "$repaired_model" ] || model="$repaired_model"
-    resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+    # Try the deterministic salvage before spending the one repair turn: the
+    # recurring brace/duplicate-key breaks survive being pointed out.
+    salvaged=$(printf '%s' "$resp" | _judge_salvage_json 2>/dev/null || true)
+    [ -n "$salvaged" ] && resp="$salvaged"
+    if ! printf '%s' "$resp" | _rubric_response_valid "$salvage_n" "$salvage_names"; then
+      first_err=$(_judge_rejection_detail "$first_resp" "$first_err")
+      repair_req=$(printf '%s' "$req" | _judge_repair_request "$first_resp" "$max_tokens" "$first_err")
+      raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
+      repaired_model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
+      [ -z "$repaired_model" ] || model="$repaired_model"
+      resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+    fi
   fi
   if normalized=$(printf '%s' "$resp" | _rubric_response_normalize "$nag" "$expected_names" 2>"$rubric_errf"); then
     resp="$normalized"

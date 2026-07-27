@@ -420,10 +420,29 @@ Findings that cost real round-trips to learn, on
   bounced `evidence_level: mixed` alongside `grounding: 3` suggested "or
   classify the evidence as direct" — the judge took that option and handed two
   candidates 10/10. The check was reverted; wtcp caps leniently instead.
-- **Never synthesize report prose.** The report language is inferred by the
-  model from the instruction timeline and is unknown to wtcp, so an invented
-  English sentence lands inside a Korean report. `repair_feedback` reuses the
-  judge's own `dimension_reasons[target]`.
+- **Never write report prose — not synthesized, not borrowed.** The report
+  language is inferred by the model and is unknown to wtcp, so an invented
+  English sentence lands inside a Korean report. Reusing the judge's own
+  `dimension_reasons[target]` was tried next and is WORSE: that sentence is
+  usually praise, so a capped record printed
+  `Deduction: the central claims are directly supported`, with `Improve`
+  repeating it word for word. `repair_feedback` now leaves the feedback empty
+  (`_cap_explains`, which also relaxes `feedback_valid`/`improvement_valid`) —
+  `Caps` and `Adjustments` already state why the score is below 10. Same
+  mistake, same fix, elsewhere: `normalize_task_semantics` used to copy
+  `.strength` into the Task reason, promoting "there are command execution
+  records" into a justification for full marks; it now writes a structural
+  marker pointing at Adjustments.
+- **Some malformed JSON is unrepairable by the model but trivial for wtcp.**
+  Two shapes recur at the END of a ranking record — one closing brace too many,
+  and the record's last key re-emitted after the record already closed — and
+  the judge resends them byte-identical even when shown the offending lines.
+  `_judge_salvage_json` deletes a candidate punctuation/`"key":` line at the
+  position jq names (or the line before it), re-parses, and recurses; every
+  candidate must parse AND survive full schema validation, so a wrong guess is
+  discarded. It runs BEFORE the repair turn, so a salvageable response costs no
+  round-trip. Both real-world payloads recover in ~0.1s; unsalvageable input
+  returns non-zero immediately.
 - **Evidence level must be judged on the claims that ANSWER the instruction.**
   A narrative candidate that happened to run `pnpm test` oscillated between
   `mixed` and `narrative_only` (a 1-2 point swing that inverted the ranking
@@ -439,14 +458,15 @@ file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
 `_in_linked_worktree`, `_agent_cfg_env_pairs`, `_teammate_env_publish` (second), or `_round_base_commit`, `_wt_evidence`,
 `_wt_file_patch`, `_terminal_evidence`, `_judge_rubric`,
 `_rubric_response_valid`, `_rubric_error_summary`,
-`_judge_error_excerpt`, `_rotate_invalid_judgments`, judge budgets/prompts
+`_judge_error_excerpt`, `_judge_salvage_json`, `_rotate_invalid_judgments`,
+judge budgets/prompts
 (third), or popup
 send/fork input editing (fourth):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 141 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 152 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 
