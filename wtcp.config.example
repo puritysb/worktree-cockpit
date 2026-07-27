@@ -94,6 +94,17 @@ COCKPIT_LAUNCH_TIMEOUT=0
 # COCKPIT_STATUS_INTERVAL=3
 # COCKPIT_STATUS_IDLE=6
 
+# Sub-panes an agent spawns itself (Claude Code's teammateMode: tmux) are created
+# by the tmux server, so they inherit the tmux SESSION environment — not the
+# agent process that workmux injected `env:` into. Without this, a teammate of an
+# agent using a custom endpoint starts without its credentials and fails to
+# authenticate while the parent agent keeps working, which looks like a hang.
+# wtcp publishes the round's agent env to the session at launch and removes it
+# again on `wtcp clean`. The value is readable by anything in that tmux server
+# (`tmux show-environment`); set to 0 to opt out. `wtcp doctor` shows which
+# variables are involved.
+# COCKPIT_TEAMMATE_ENV=1
+
 # Judge/detail popup size inside tmux.
 COCKPIT_POPUP_WIDTH="92%"
 COCKPIT_POPUP_HEIGHT="85%"

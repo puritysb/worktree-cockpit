@@ -49,7 +49,8 @@ extract_fn(){ # $1 = function name -> print its definition (header line ... clos
   for f in _workmux_cfg_global _workmux_cfg_value _workmux_main_branch \
            _backup_workmux_cfg _agent_cfg_exists _agent_cfg_is_wtcp_managed \
            _agent_cfg_command _agent_cfg_is_block _set_agent_cfg _diff_base \
-           _in_linked_worktree _cockpit_worktrees cmd_clean; do
+           _in_linked_worktree _cockpit_worktrees cmd_clean \
+           _agent_cfg_env_pairs _teammate_env_publish _teammate_env_clear; do
     extract_fn "$f"
   done
 } > "$TMP/functions.sh"
@@ -161,6 +162,74 @@ grep -q 'my-own-feature' "$WM_CALLS" && fail "user's own worktree untouched" || 
 is "--all aborts without a confirmed yes" "$(cat "$WM_CALLS")" ""
 : > "$WM_CALLS"
 (cmd_clean --bogus) >/dev/null 2>&1 && fail "unknown flag rejected" || pass "unknown flag rejected"
+
+echo "T7: teammate panes inherit the agent's workmux env"
+# Claude Code's teammateMode creates sub-panes through the tmux SERVER, which
+# seeds them from the SESSION environment — not from the agent process workmux
+# injected `env:` into. Observed in the wild: every teammate of a z.ai-backed
+# agent died with "401 token expired or incorrect" because the spawner forwards
+# ANTHROPIC_BASE_URL but withholds ANTHROPIC_AUTH_TOKEN.
+cat >> "$CFG" <<'EOF'
+  envagent:
+    type: claude
+    command: claude
+    args:
+      - --model
+      - glm-5.2
+    env:
+      AGENT_BASE_URL: https://example.invalid/api
+      AGENT_TOKEN:
+        from_env: TEST_TOKEN_SOURCE
+      AGENT_MISSING:
+        from_env: TEST_TOKEN_ABSENT
+  plainagent:
+    type: claude
+    command: claude
+EOF
+export TEST_TOKEN_SOURCE="s3cr3t-value"
+unset TEST_TOKEN_ABSENT
+PAIRS=$(_agent_cfg_env_pairs envagent)
+is "plain env entry is read" "$(printf '%s\n' "$PAIRS" | grep -c '^AGENT_BASE_URL=https://example.invalid/api$')" "1"
+is "from_env entry resolves against the environment" "$(printf '%s\n' "$PAIRS" | grep -c '^AGENT_TOKEN=s3cr3t-value$')" "1"
+is "an unset from_env source publishes nothing" "$(printf '%s\n' "$PAIRS" | grep -c '^AGENT_MISSING')" "0"
+is "an agent without an env block yields nothing" "$(_agent_cfg_env_pairs plainagent | wc -l | tr -d ' ')" "0"
+is "the next agent's block does not bleed in" "$(printf '%s\n' "$PAIRS" | wc -l | tr -d ' ')" "2"
+
+tmux set-environment -t s AGENT_BASE_URL "https://user-set.invalid" 2>/dev/null
+PUBLISHED=$(_teammate_env_publish s envagent)
+is "a differing pre-existing session value is left alone" \
+  "$(tmux show-environment -t s AGENT_BASE_URL 2>/dev/null)" "AGENT_BASE_URL=https://user-set.invalid"
+is "only wtcp's own additions are reported" "$PUBLISHED" "AGENT_TOKEN "
+is "the agent token reaches the session" \
+  "$(tmux show-environment -t s AGENT_TOKEN 2>/dev/null)" "AGENT_TOKEN=s3cr3t-value"
+# A pane created afterwards must actually receive it — that is the whole point.
+tmux new-window -d -t s -n envprobe "printenv > $TMP/probe.txt; sleep 5"
+sleep 1
+is "a pane created later inherits the published token" \
+  "$(grep -c '^AGENT_TOKEN=s3cr3t-value$' "$TMP/probe.txt" 2>/dev/null || echo 0)" "1"
+tmux kill-window -t s:envprobe 2>/dev/null
+
+_teammate_env_clear s "$PUBLISHED"
+is "clear removes what wtcp published" "$(tmux show-environment -t s AGENT_TOKEN 2>&1 | grep -c 'unknown variable')" "1"
+is "clear leaves the user's own session value" \
+  "$(tmux show-environment -t s AGENT_BASE_URL 2>/dev/null)" "AGENT_BASE_URL=https://user-set.invalid"
+tmux set-environment -u -t s AGENT_BASE_URL 2>/dev/null
+
+is "publishing is opt-out-able" "$(COCKPIT_TEAMMATE_ENV=0 _teammate_env_publish s envagent)" ""
+is "opt-out really sets nothing" "$(tmux show-environment -t s AGENT_TOKEN 2>&1 | grep -c 'unknown variable')" "1"
+
+case "$(<"$WTCOP")" in
+  *'_teammate_env_publish "$round_session" $COCKPIT_AGENTS'*) pass "the round publishes before launching agents" ;;
+  *) fail "the round publishes before launching agents" ;;
+esac
+case "$(<"$WTCOP")" in
+  *'@cockpit_env "$published_env"'*) pass "the round records only what it published" ;;
+  *) fail "the round records only what it published" ;;
+esac
+case "$(<"$WTCOP")" in
+  *'[ -n "$kept_env" ] && tmux set-option -w -t "$nwin" @cockpit_env "$kept_env"'*) pass "a kept window keeps the env stamp" ;;
+  *) fail "a kept window keeps the env stamp" ;;
+esac
 
 echo
 echo "results: $PASS passed, $FAIL failed"

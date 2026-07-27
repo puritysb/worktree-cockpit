@@ -337,6 +337,26 @@ This file is the design/gotcha memory for working ON wtcp itself.
    by `@worktree`, so teammate panes are naturally skipped — they're never fed
    to the LLM judge and never show ★ scores. Teammates DO get 🤖/💬/✅ from
    workmux's status hooks (they're real agent processes), which is desirable.
+   **Those sub-panes are created by the tmux SERVER, so they are seeded from the
+   SESSION environment — not from the agent process.** workmux injects an
+   agent's `env:` into the launched process only, so a teammate gets whatever
+   the spawner forwards explicitly and nothing else. Observed in the wild:
+   Claude Code forwards `ANTHROPIC_BASE_URL` but withholds
+   `ANTHROPIC_AUTH_TOKEN`, so all five teammates of a z.ai-backed agent died
+   with `401 token expired or incorrect` while the parent kept working — and
+   the parent then waited ~35 minutes for reports that never came. It looks
+   like a hung agent, not an auth failure. `_run_round` therefore publishes the
+   round's agent env (`_agent_cfg_env_pairs`, `from_env` resolved) onto the
+   tmux session before launching, stamps exactly what it added on
+   `@cockpit_env`, and `cmd_clean` removes only those; a variable the session
+   already carried with a different value is left alone and reported. Verified
+   that a session variable reaches a new pane even when the spawner passes its
+   own `-e` list. This DOES widen the blast radius — the value is readable by
+   anything in that tmux server via `tmux show-environment` — so it is
+   documented in `wtcp doctor` and opt-out-able with `COCKPIT_TEAMMATE_ENV=0`.
+   `_teammate_env_publish`'s stdout is its return value; its conflict notice
+   must go to stderr or the warning text is parsed as published variable names
+   and the cleanup unsets the user's own variable.
 19. **Popup text input must use Readline, not terminal canonical editing.**
    Plain `read` makes arrow keys literal escape bytes and can corrupt multibyte
    Korean text when editing. `_read_editable_line` uses `read -e`; send/fork
@@ -363,6 +383,7 @@ Agents/launch: `COCKPIT_AGENTS`, `COCKPIT_AGENT_<ALIAS>_CMD` (full command, wins
 `COCKPIT_AGENT_<ALIAS>_KIND`, `COCKPIT_TRUST`, `COCKPIT_CLAUDE_CMD`,
 `COCKPIT_CODEX_CMD`, `COCKPIT_SENDKEYS_AGENTS`, `COCKPIT_SEND_DELAY`,
 `COCKPIT_AGY_DELAY`, `COCKPIT_LAUNCH_TIMEOUT`, `COCKPIT_STATUS`,
+`COCKPIT_TEAMMATE_ENV` (0 = never publish agent env to the tmux session),
 `COCKPIT_STATUS_INTERVAL`.
 Naming: `COCKPIT_NAMER` (fm|mlx|off), `COCKPIT_NAMER_URL`, `COCKPIT_NAMER_MODEL`,
 `COCKPIT_NAMER_AUTH`, `COCKPIT_FM_HELPER`, `COCKPIT_DAEMON_PORT`, `COCKPIT_DAEMON_URL`.
@@ -415,7 +436,7 @@ Fast unit-style regression tests (no real agents/tmux/workmux pollution) live
 under `tests/`. Run them after touching `_workmux_pane_status`,
 `_retile_with_teammates`, `cmd_status_watch`, or `_apply_grid_layout` (first
 file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
-`_in_linked_worktree` (second), or `_round_base_commit`, `_wt_evidence`,
+`_in_linked_worktree`, `_agent_cfg_env_pairs`, `_teammate_env_publish` (second), or `_round_base_commit`, `_wt_evidence`,
 `_wt_file_patch`, `_terminal_evidence`, `_judge_rubric`,
 `_rubric_response_valid`, `_rubric_error_summary`,
 `_judge_error_excerpt`, `_rotate_invalid_judgments`, judge budgets/prompts
@@ -424,7 +445,7 @@ send/fork input editing (fourth):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
-bash tests/test_workmux_coexist.sh   # 32 assertions; also a throwaway git repo
+bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
 bash tests/test_judge_evidence.sh    # 141 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```

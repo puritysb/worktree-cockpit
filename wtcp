@@ -442,6 +442,103 @@ _agent_cfg_is_block(){   # $1 = agent
 # Set/replace an agent's command in the workmux global agents map (idempotent).
 # (workmux honors overrides of builtin names and appends the prompt as -- "...".)
 # Refuses to overwrite a hand-written entry — returns 1 so the caller can warn.
+# An agent's `env:` block, from_env indirection resolved against the caller's
+# environment. Same "deliberately shallow" YAML handling as _workmux_cfg_value:
+# the agent key at any indent, its env entries one level deeper, and the single
+# nested form workmux documents (`NAME:` / `  from_env: OTHER`).
+_agent_cfg_env_pairs(){   # $1 = agent alias -> NAME=VALUE lines
+  local agent="$1" f root key raw name value found=0
+  root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  for f in ${root:+"$root/.workmux.yaml"} "$(_workmux_cfg_global)"; do
+    [ -f "$f" ] || continue
+    while IFS="$(printf '\t')" read -r key raw; do
+      [ -n "$key" ] || continue
+      case "$raw" in
+        FROM_ENV:*)
+          name="${raw#FROM_ENV:}"
+          [ -n "${!name+x}" ] || continue
+          value="${!name}"
+          ;;
+        *) value="$raw" ;;
+      esac
+      value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+      [ -n "$value" ] || continue
+      printf '%s=%s\n' "$key" "$value"
+      found=1
+    done < <(awk -v a="$agent" '
+      function indent(s,   i){ i = match(s, /[^ ]/); return i > 0 ? i - 1 : -1 }
+      !inagent && $0 ~ "^[[:space:]]*" a ":[[:space:]]*$" { ai = indent($0); inagent = 1; next }
+      inagent {
+        ind = indent($0)
+        if (ind >= 0 && ind <= ai) { exit }
+        if (!inenv && $0 ~ /^[[:space:]]*env:[[:space:]]*$/) { inenv = 1; ei = ind; next }
+        if (inenv) {
+          if (ind >= 0 && ind <= ei) { exit }
+          line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]*#.*$/, "", line)
+          if (line == "") { next }
+          if (ind == ei + 2) {
+            key = line; sub(/:.*$/, "", key)
+            val = line; sub(/^[^:]*:[[:space:]]*/, "", val)
+            if (val == "") { pend = key } else { printf "%s\t%s\n", key, val; pend = "" }
+            next
+          }
+          if (pend != "" && line ~ /^from_env:/) {
+            val = line; sub(/^from_env:[[:space:]]*/, "", val)
+            printf "%s\tFROM_ENV:%s\n", pend, val
+            pend = ""
+          }
+        }
+      }
+    ' "$f" 2>/dev/null || true)
+    [ "$found" -eq 1 ] && return 0
+  done
+  return 0
+}
+# An agent that fans out via tmux (Claude Code's teammateMode) creates its
+# sub-panes through the tmux SERVER, which seeds them from the session
+# environment — not from the agent process. workmux injects `env:` into the
+# agent process only, so a teammate inherits whatever the spawner forwards
+# explicitly and nothing else. Observed: Claude Code forwards ANTHROPIC_BASE_URL
+# but deliberately withholds ANTHROPIC_AUTH_TOKEN, so every teammate of a
+# z.ai-backed agent died with "401 token expired or incorrect" while the parent
+# ran fine. Publishing the round's agent env onto the session fixes it —
+# verified that session vars reach a pane even when the spawner passes its own
+# `-e` list.
+_teammate_env_publish(){   # $1=session $2..=agent aliases -> space-separated published names
+  local sess="$1"; shift
+  local agent pair name value existing published=()
+  [ "${COCKPIT_TEAMMATE_ENV:-1}" = 1 ] || return 0
+  [ -n "$sess" ] || return 0
+  for agent in "$@"; do
+    while IFS= read -r pair; do
+      name="${pair%%=*}"; value="${pair#*=}"
+      [ -n "$name" ] || continue
+      existing=$(tmux show-environment -t "$sess" "$name" 2>/dev/null || true)
+      case "$existing" in
+        "$name="*)
+          # Never silently redefine something the session already carries.
+          # This function's STDOUT is its return value, so the notice goes to
+          # stderr — otherwise the warning text is parsed as published names and
+          # _teammate_env_clear later unsets the user's own variable.
+          [ "${existing#*=}" = "$value" ] || \
+            say "leaving session ${name} as-is (differs from ${agent}'s workmux env; teammates will use the session value)" >&2
+          continue
+          ;;
+      esac
+      tmux set-environment -t "$sess" "$name" "$value" 2>/dev/null || continue
+      published+=("$name")
+    done < <(_agent_cfg_env_pairs "$agent")
+  done
+  [ "${#published[@]}" -gt 0 ] || return 0
+  printf '%s' "$(printf '%s\n' "${published[@]}" | sort -u | tr '\n' ' ')"
+}
+_teammate_env_clear(){   # $1=session $2=space-separated names published by this round
+  local sess="$1" names="${2:-}" name
+  [ -n "$sess" ] && [ -n "$names" ] || return 0
+  for name in $names; do
+    tmux set-environment -u -t "$sess" "$name" 2>/dev/null || true
+  done
+}
 _set_agent_cfg(){
   local CFG agent="$1" cmd="$2" line esc
   CFG=$(_workmux_cfg_global)
@@ -958,6 +1055,14 @@ _run_round(){
   # has-changes test in cmd_pick that decides merge-vs-keep.
   addargs+=(--base "$round_base_commit")
 
+  # Publish BEFORE launch: an agent may fan out into tmux sub-panes at any
+  # moment, and those panes are seeded from the session environment as it stood
+  # when tmux created them.
+  local round_session published_env=""
+  round_session=$(tmux display -p -t "$(_cur_win)" '#{session_name}' 2>/dev/null || true)
+  published_env=$(_teammate_env_publish "$round_session" $COCKPIT_AGENTS)
+  [ -z "$published_env" ] || say "teammate env published to session $round_session: $published_env"
+
   local nag neww found_count add_status=0 timeout_s deadline now
   nag=0; for a in $COCKPIT_AGENTS; do nag=$((nag+1)); done
   say "'$task' -> [$COCKPIT_AGENTS]${base:+ (base: $base)} launching..."
@@ -990,6 +1095,7 @@ _run_round(){
   tmux set-option -w -t "$cwin" @cockpit_score_round 0
   tmux set-option -w -t "$cwin" @cockpit_base "$round_base_commit"  # immutable judge/pick diff base
   tmux set-option -w -t "$cwin" @cockpit_from_worktree "$from_worktree"
+  tmux set-option -w -t "$cwin" @cockpit_env "$published_env"   # cleared by cmd_clean; only what THIS round added
   local apanes=() join_lines=() line idx
   while IFS= read -r line; do [ -n "$line" ] && join_lines+=("$line"); done <<< "$neww"
   # join-pane inserts each joined pane before the existing panes in this tmux
@@ -2604,6 +2710,10 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   score_round=$(tmux show-options -wqv -t "$cwin" @cockpit_score_round 2>/dev/null || true)
   base=$(tmux show-options -wqv -t "$cwin" @cockpit_base 2>/dev/null || true)
   local from_wt; from_wt=$(tmux show-options -wqv -t "$cwin" @cockpit_from_worktree 2>/dev/null || true)
+  # The kept agent can still fan out into teammate panes, so the published env
+  # must outlive the grid — and the stamp must travel too, or cmd_clean would
+  # later leave those session variables behind.
+  local kept_env; kept_env=$(tmux show-options -wqv -t "$cwin" @cockpit_env 2>/dev/null || true)
   pcount=$(tmux list-panes -t "$cwin" -F x | grep -c . || true)
   if [ "$pcount" -le 1 ]; then
     # The window already holds ONLY the keeper (keep/pick pressed again in an
@@ -2623,6 +2733,7 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   [ -n "$score_round" ] && tmux set-option -w -t "$nwin" @cockpit_score_round "$score_round"
   [ -n "$base" ]   && tmux set-option -w -t "$nwin" @cockpit_base "$base"
   [ -n "$from_wt" ] && tmux set-option -w -t "$nwin" @cockpit_from_worktree "$from_wt"
+  [ -n "$kept_env" ] && tmux set-option -w -t "$nwin" @cockpit_env "$kept_env"
   _style_window "$nwin"
   local l
   for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done
@@ -2890,6 +3001,28 @@ _doctor_workmux_compat(){
     printf '    yours          %s   (hand-written; wtcp never overwrites them, so\n' "$yours"
     printf '                   COCKPIT_AGENT_*_CMD/_MODEL for those names is ignored)\n'
   }
+  # A teammate that cannot authenticate looks exactly like a slow agent: the
+  # pane just sits there. Say up front which variables a fan-out would need.
+  local envnames="" pair
+  for a in $COCKPIT_AGENTS; do
+    while IFS= read -r pair; do
+      [ -n "$pair" ] || continue
+      case " $envnames " in *" ${pair%%=*} "*) ;; *) envnames="${envnames:+$envnames }${pair%%=*}" ;; esac
+    done < <(_agent_cfg_env_pairs "$a")
+  done
+  if [ -n "$envnames" ]; then
+    if [ "${COCKPIT_TEAMMATE_ENV:-1}" = 1 ]; then
+      printf '    teammate env   %s\n' "$envnames"
+      printf '                   published to the tmux SESSION at round start so panes an agent\n'
+      printf '                   spawns (Claude Code teammateMode) inherit them; cleared by\n'
+      printf '                   wtcp clean. Readable by anything in this tmux server —\n'
+      printf '                   set COCKPIT_TEAMMATE_ENV=0 to opt out.\n'
+    else
+      printf '    teammate env   DISABLED (COCKPIT_TEAMMATE_ENV=0) — %s reach the agent only.\n' "$envnames"
+      printf '                   Panes an agent spawns will start without them and may fail to\n'
+      printf '                   authenticate while the parent agent keeps working.\n'
+    fi
+  fi
   return 0
 }
 
@@ -3082,9 +3215,18 @@ cmd_clean(){
       for wt in "${wts[@]}"; do _wm remove "$wt" -f || true; done
     fi
   fi
-  # 2) Close any leftover grid windows (their joined panes aren't workmux-tracked
-  #    so `remove` can't close them). Kill the window we're in LAST.
+  # 2) Drop the session env this round published for teammate panes, and ONLY
+  #    that: @cockpit_env lists what wtcp actually set, so a variable the user
+  #    already had survives. Must run before the window kills below take the
+  #    stamps (and this script) with them.
   local w cur; cur=$(_cur_win 2>/dev/null || true)
+  local sess; sess=$(tmux display -p ${cur:+-t "$cur"} '#{session_name}' 2>/dev/null || true)
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    _teammate_env_clear "$sess" "$(tmux show-options -wqv -t "$w" @cockpit_env 2>/dev/null || true)"
+  done < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')
+  # 3) Close any leftover grid windows (their joined panes aren't workmux-tracked
+  #    so `remove` can't close them). Kill the window we're in LAST.
   while IFS= read -r w; do
     [ -n "$w" ] && [ "$w" != "$cur" ] && tmux kill-window -t "$w" 2>/dev/null || true
   done < <(tmux list-windows -F '#{window_id} #{window_name}' 2>/dev/null | awk -v p="^${WIN_PREFIX}:" '$2 ~ p{print $1}')
