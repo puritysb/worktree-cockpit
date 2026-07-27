@@ -1488,6 +1488,67 @@ _wt_evidence(){   # $1=worktree path $2=base ref $3=target chars -> manifest + b
 _wt_diff(){   # judge evidence package; optional $3 overrides the target budget
   _wt_evidence "$1" "${2:-}" "${3:-$COCKPIT_JUDGE_DIFF_CHARS}"
 }
+_claim_path_check(){   # $1=worktree $2=terminal text $3=max entries -> resolved path table
+  # In an analysis round there is no diff, so the manifest (top-level entries
+  # only) can never confirm a claim about a nested file. Every competent
+  # candidate therefore had to be graded "mixed", capping it at 9 and collapsing
+  # genuinely different answers onto the same score. Resolve the paths the
+  # response actually cites against the worktree instead: EXISTS/MISSING here is
+  # wtcp reading the repository, not the agent asserting.
+  local wt="$1" text="$2" max="${3:-40}" rel abs n=0 total=0 stem refs kind
+  [ -n "$wt" ] && [ -d "$wt" ] || return 0
+  [ -n "$text" ] || return 0
+  local found=() slashed
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in
+      node_modules/*|*/node_modules/*|.git/*) continue ;;
+      # Agent TUIs elide long paths ("plugin/.../option-scenario.test.ts").
+      # Resolving an elided path would report MISSING for a file that exists —
+      # an accusation wtcp invented.
+      *..*|*…*) continue ;;
+    esac
+    case "$rel" in */*) slashed=1 ;; *) slashed=0 ;; esac
+    # A bare filename that does not resolve is far more likely to be prose than
+    # a claim; reporting it MISSING would invent an accusation.
+    [ "$slashed" -eq 1 ] || [ -e "$wt/$rel" ] || continue
+    found+=("$rel")
+  done < <(printf '%s' "$text" \
+    | grep -oE '([A-Za-z0-9_@.-]+/)+[A-Za-z0-9_@.-]+\.[A-Za-z0-9]+|[A-Za-z0-9_@.-]+\.(ts|tsx|js|mjs|cjs|json|ya?ml|md|sh|py|swift|kt|kts|cpp|hpp|rs|go|toml)' 2>/dev/null \
+    | sed -e 's|^\./||' -e "s|^${wt}/||" -e 's|^/||' \
+    | sort -u)
+  total=${#found[@]}
+  [ "$total" -gt 0 ] || return 0
+  printf '\n=== PATH CLAIM CHECK (resolved by wtcp, not by the candidate) ===\n'
+  printf 'Each path this response cites, looked up on disk. Treat EXISTS/MISSING and\n'
+  printf 'the test-reference column as PRIMARY evidence for those claims.\n'
+  for rel in "${found[@]}"; do
+    [ "$n" -lt "$max" ] || break
+    n=$((n+1))
+    abs="$wt/$rel"
+    if [ -e "$abs" ]; then
+      case "$rel" in
+        *test*|*spec*|*__tests__*) kind="other" ;;
+        # Only real code modules can meaningfully be "covered by tests".
+        # Running this on docs matched the stem CLAUDE in unrelated files.
+        *.ts|*.tsx|*.js|*.mjs|*.cjs|*.swift|*.kt|*.kts|*.py|*.go|*.rs|*.cpp|*.c|*.h) kind="source" ;;
+        *) kind="other" ;;
+      esac
+      if [ "$kind" = source ] && [ -f "$abs" ]; then
+        stem=$(basename "$rel"); stem="${stem%.*}"
+        refs=$(git -C "$wt" grep -lw --cached -F -- "$stem" -- '*test*' '*spec*' '*__tests__*' 2>/dev/null | head -3 | tr '\n' ' ')
+        printf 'EXISTS   %s   (%s lines)   referenced-by-tests: %s\n' \
+          "$rel" "$(wc -l < "$abs" 2>/dev/null | tr -d ' ')" "${refs:-NONE}"
+      else
+        printf 'EXISTS   %s   (%s lines)\n' "$rel" "$(wc -l < "$abs" 2>/dev/null | tr -d ' ')"
+      fi
+    else
+      printf 'MISSING  %s   (cited but not present in this worktree)\n' "$rel"
+    fi
+  done
+  [ "$total" -le "$max" ] || printf '(%s further cited paths omitted for budget)\n' "$((total-max))"
+  return 0
+}
 _judge_output_budget(){   # $1=combined target $2=actual change evidence $3=minimum terminal target
   local combined="$1" evidence="$2" minimum="${3:-800}" output
   output=$((combined-evidence))
@@ -1581,6 +1642,7 @@ Classify the evidence for central claims:
 - direct: every central factual/numeric claim is supported by visible raw command/test output or a visible source/config excerpt. An agent-authored conclusion, an exact-looking number, a path citation, a pass count, or a claim marked "verified" is not direct evidence by itself.
 - mixed: repository identity and some central claims have direct support, but at least one central conclusion relies on agent-authored narrative, inference, or an unseen command result. Grounding is at most 2 and wtcp caps the total at 9.
 - narrative_only: central conclusions rely on the agent's narrative without visible primary support. Grounding is at most 1 and wtcp caps the total at 8.
+The PATH CLAIM CHECK block, when present, is wtcp resolving the paths a response cites against the worktree itself — it is primary evidence, not an agent claim. A file-level assertion confirmed there (EXISTS/MISSING, line counts, referenced-by-tests) counts as DIRECT support for that assertion, and an assertion it contradicts is disproved. Absence of a path from that block means only that the response did not cite it; never treat that as disproof. A response whose central claims are all confirmed there can reach evidence_level direct.
 Classify by the evidence behind the claims that ANSWER THE INSTRUCTION, not by incidental command output the candidate happened to run. A visible test run supports "the suite currently passes"; it is not support for a claim about whether the test set is well composed. If the deliverable is an assessment and the assessment itself rests on the candidate's narrative, the level is narrative_only even when unrelated commands are visible.
 Use the candidate's evidence, not confidence or precision, for this classification. Score 10 is exceptional: evidence_level must be direct, every explicit requirement must be fulfilled, no material uncertainty may remain, and every dimension must independently deserve its maximum.
 
@@ -2165,8 +2227,8 @@ EOF
 }
 
 _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $6=base ref -> "score|reason|model"
-  local path="$1" prompt="$2" timeline="$3" score_round="$4" pane="$5" base="${6:-}" diff out req raw resp model score reason instr lang_rule rubric_line caps_line evidence_line dimension_lines adjustments_line
-  local diff_chars combined_budget out_budget max_tokens repair_req repaired_model first_resp normalized
+  local path="$1" prompt="$2" timeline="$3" score_round="$4" pane="$5" base="${6:-}" diff out claims req raw resp model score reason instr lang_rule rubric_line caps_line evidence_line dimension_lines adjustments_line
+  local diff_chars combined_budget out_budget claim_chars max_tokens repair_req repaired_model first_resp normalized
   local rubric_errf rubric_err="" first_err="" salvaged="" salvage_n=0 salvage_names="[]"
   rubric_errf=$(mktemp "${TMPDIR:-/tmp}/wtcp-rubric.XXXXXX") || rubric_errf="${TMPDIR:-/tmp}/wtcp-rubric.$$"
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
@@ -2179,12 +2241,19 @@ _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $
   combined_budget=$((COCKPIT_JUDGE_DIFF_CHARS+COCKPIT_JUDGE_OUTPUT_CHARS))
   out_budget=$(_judge_output_budget "$combined_budget" "$diff_chars" 800)
   out=$(_terminal_evidence "$pane" "$out_budget")
+  # The claim table is derived from the terminal excerpt, so budget it out of
+  # the same pool rather than silently exceeding COCKPIT_JUDGE_* by its size.
+  claims=$(_claim_path_check "$path" "$out" 40)
+  claim_chars=$(printf '%s' "$claims" | wc -c | tr -d ' ')
+  if [ "$claim_chars" -gt 0 ] && [ "$((out_budget - claim_chars))" -ge 800 ]; then
+    out=$(_terminal_evidence "$pane" "$((out_budget - claim_chars))")
+  fi
   instr=$(_judge_single_instructions)
   lang_rule=$(_judge_output_language_rule)
   max_tokens=$(_judge_single_max_tokens)
-  req=$(jq -nc --arg s "$instr" --arg t "$timeline" --arg r "${score_round:-1}" --arg lang_rule "$lang_rule" --arg d "${diff:-(none)}" --arg o "$out" --arg m "${COCKPIT_JUDGE_MODEL:-}" \
+  req=$(jq -nc --arg s "$instr" --arg t "$timeline" --arg r "${score_round:-1}" --arg lang_rule "$lang_rule" --arg d "${diff:-(none)}" --arg o "$out" --arg c "$claims" --arg m "${COCKPIT_JUDGE_MODEL:-}" \
     --argjson max_tokens "$max_tokens" \
-    '{messages:[{role:"user",content:($s + "\n\nScore round: " + $r + "\nOutput language rule:\n" + $lang_rule + "\n\nInstruction timeline:\n" + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o)}],max_tokens:$max_tokens,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
+    '{messages:[{role:"user",content:($s + "\n\nScore round: " + $r + "\nOutput language rule:\n" + $lang_rule + "\n\nInstruction timeline:\n" + $t + "\n\nDiff vs base (may be empty):\n" + $d + "\n\nAgent terminal output:\n" + $o + "\n" + $c)}],max_tokens:$max_tokens,temperature:0.2} + (if $m == "" then {} else {model:$m} end)')
   raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
   resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
@@ -2427,16 +2496,21 @@ cmd_score(){
   # deliverable for analysis/review rounds.
   local combined_per=$(( COCKPIT_JUDGE_COMPARE_CHARS / nag )); [ "$combined_per" -ge 1600 ] || combined_per=1600
   local change_target=$((combined_per/2)); [ "$change_target" -ge 800 ] || change_target=800
-  local i blocks="" path diff out prev_label prev_reason diff_chars out_budget
+  local i blocks="" path diff out claims claim_chars prev_label prev_reason diff_chars out_budget
   for (( i=0; i<nag; i++ )); do
     path=$(_wt_path "${names[i]}")
     [ -n "$path" ] && diff=$(_wt_diff "$path" "$base" "$change_target") || diff=""
     diff_chars=$(printf '%s' "$diff" | wc -c | tr -d ' ')
     out_budget=$(_judge_output_budget "$combined_per" "$diff_chars" 800)
     out=$(_terminal_evidence "${panes[i]}" "$out_budget")
+    claims=$(_claim_path_check "$path" "$out" 40)
+    claim_chars=$(printf '%s' "$claims" | wc -c | tr -d ' ')
+    if [ "$claim_chars" -gt 0 ] && [ "$((out_budget - claim_chars))" -ge 800 ]; then
+      out=$(_terminal_evidence "${panes[i]}" "$((out_budget - claim_chars))")
+    fi
     prev_label="${prev_labels[i]}"
     prev_reason="${prev_reasons[i]}"
-    blocks="${blocks}"$'\n\n'"=== AGENT: ${names[i]} ==="$'\n'"--- Previous judge note (context only; may be absent) ---"$'\n'"${prev_label:-none}"$'\n'"${prev_reason:-}"$'\n'"--- Diff vs base (may be empty) ---"$'\n'"${diff}"$'\n'"--- Terminal output ---"$'\n'"${out}"
+    blocks="${blocks}"$'\n\n'"=== AGENT: ${names[i]} ==="$'\n'"--- Previous judge note (context only; may be absent) ---"$'\n'"${prev_label:-none}"$'\n'"${prev_reason:-}"$'\n'"--- Diff vs base (may be empty) ---"$'\n'"${diff}"$'\n'"--- Terminal output ---"$'\n'"${out}"$'\n'"${claims}"
   done
 
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")

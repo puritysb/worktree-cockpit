@@ -28,7 +28,7 @@ extract_fn(){ # $1 = function name -> print its definition (header line ... clos
   echo 'COCKPIT_JUDGE_OUTPUT_CHARS=3200'
   echo '_workmux_main_branch(){ printf master; }'
   for f in _round_base_commit _diff_base _wt_file_patch _wt_evidence _wt_diff \
-           _judge_output_budget _terminal_evidence _judge_rubric _rubric_response_normalize \
+           _judge_output_budget _terminal_evidence _claim_path_check _judge_rubric _rubric_response_normalize \
            _rubric_response_valid \
            _rubric_error_summary _judge_error_excerpt _judge_rejection_detail \
            _json_parse_error_line _salvage_try _judge_salvage_json \
@@ -420,6 +420,36 @@ has "invalid response log preserves first response" "bad one" "$INVALID_LOG"
 has "invalid response log preserves repair response" "bad two" "$INVALID_LOG"
 has "fallback report exposes diagnostic path" "Mode: independent fallback" "$(<"$WTCOP")"
 has "fallback respects noninteractive menu setting" '[ "$COCKPIT_NO_INTERACTIVE_MENUS" = "1" ] || _winner_menu "$cwin"' "$(<"$WTCOP")"
+
+echo "T10: path claims are resolved against the worktree"
+# With no diff, the manifest (top-level entries only) can never confirm a claim
+# about a nested file, so every competent candidate had to be graded "mixed" and
+# capped at 9 — collapsing genuinely different answers onto one score.
+CLAIM_TEXT="I checked src/product.ts and tests/product.test.ts, plus a missing
+one at src/nowhere.ts. Long paths get elided as plugin/.../option.test.ts.
+Vendored code under node_modules/pkg/index.js is irrelevant."
+CLAIMS=$(_claim_path_check "$WT" "$CLAIM_TEXT" 40)
+has "an existing cited path is resolved" "EXISTS   src/product.ts" "$CLAIMS"
+has "a cited path that is absent is reported" "MISSING  src/nowhere.ts" "$CLAIMS"
+has "the table declares itself primary evidence" "resolved by wtcp, not by the candidate" "$CLAIMS"
+has "a source module reports its test references" "referenced-by-tests:" "$CLAIMS"
+case "$CLAIMS" in
+  *"plugin/.../option.test.ts"*) fail "an elided path is never reported missing" ;;
+  *) pass "an elided path is never reported missing" ;;
+esac
+case "$CLAIMS" in
+  *node_modules*) fail "vendored paths are ignored" ;;
+  *) pass "vendored paths are ignored" ;;
+esac
+# A bare word that happens to look like a filename must not become an accusation.
+case "$(_claim_path_check "$WT" "we discussed config.yml briefly" 40)" in
+  *"MISSING"*) fail "an unresolvable bare filename is not accused" ;;
+  *) pass "an unresolvable bare filename is not accused" ;;
+esac
+[ -z "$(_claim_path_check "$WT" "" 40)" ] \
+  && pass "no citations produce no block" || fail "no citations produce no block"
+has "the rubric treats the check as primary evidence" "PATH CLAIM CHECK block" "$(_judge_rubric)"
+has "both judge paths attach the check" "_claim_path_check" "$(<"$WTCOP")"
 
 echo "T9: actionable rejections and cap-aware normalization"
 # A rejection the model cannot locate is a rejection it cannot fix: Qwen answered

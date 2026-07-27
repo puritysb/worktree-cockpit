@@ -443,6 +443,26 @@ Findings that cost real round-trips to learn, on
   discarded. It runs BEFORE the repair turn, so a salvageable response costs no
   round-trip. Both real-world payloads recover in ~0.1s; unsalvageable input
   returns non-zero immediately.
+- **Give the judge ground truth instead of tuning the cap.** With no diff the
+  manifest (top-level entries only) can never confirm a claim about a nested
+  file, so every competent candidate had to be graded `mixed`. `_claim_path_check`
+  resolves the paths a response actually cites against the worktree —
+  EXISTS/MISSING, line counts, and `referenced-by-tests` for source modules —
+  and the rubric names it primary evidence. Elided paths (`plugin/.../x.ts`),
+  vendored paths, and bare filenames that do not resolve are skipped, because
+  reporting those MISSING would be wtcp inventing an accusation. It is budgeted
+  out of the same pool as the terminal excerpt. **It did NOT break the score
+  compression** (see below); what it did buy is specificity — the judge now
+  cites the table and names the exact residual gap ("about 25-30" as an
+  estimate rather than a count) instead of a vague grounding complaint.
+- **Cap compression at the top is structural and still unsolved.** `mixed`
+  caps the total at 9, so any candidate the judge rates 4/3/2/1 lands on 9 and
+  genuinely different strong answers tie. The path claim check moved the
+  blocker from unverifiable PATHS to unverifiable NUMBERS (LOC counts,
+  coverage figures, "about N tests"), which wtcp cannot resolve in general.
+  Measured 9/9 for the top two in 4/4 samples afterwards. The synthesized
+  tie-break names a reason, and two close answers tying is arguably correct —
+  do not "fix" this by raising the cap, which would gut the evidence gate.
 - **Evidence level must be judged on the claims that ANSWER the instruction.**
   A narrative candidate that happened to run `pnpm test` oscillated between
   `mixed` and `narrative_only` (a 1-2 point swing that inverted the ranking
@@ -456,7 +476,7 @@ under `tests/`. Run them after touching `_workmux_pane_status`,
 `_retile_with_teammates`, `cmd_status_watch`, or `_apply_grid_layout` (first
 file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
 `_in_linked_worktree`, `_agent_cfg_env_pairs`, `_teammate_env_publish` (second), or `_round_base_commit`, `_wt_evidence`,
-`_wt_file_patch`, `_terminal_evidence`, `_judge_rubric`,
+`_wt_file_patch`, `_terminal_evidence`, `_claim_path_check`, `_judge_rubric`,
 `_rubric_response_valid`, `_rubric_error_summary`,
 `_judge_error_excerpt`, `_judge_salvage_json`, `_rotate_invalid_judgments`,
 judge budgets/prompts
@@ -466,7 +486,7 @@ send/fork input editing (fourth):
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 152 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 162 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 
