@@ -1543,7 +1543,30 @@ _claim_path_check(){   # $1=worktree $2=terminal text $3=max entries -> resolved
         printf 'EXISTS   %s   (%s lines)\n' "$rel" "$(wc -l < "$abs" 2>/dev/null | tr -d ' ')"
       fi
     else
-      printf 'MISSING  %s   (cited but not present in this worktree)\n' "$rel"
+      # Responses abbreviate paths for readability — an agent wrote
+      # "bridge/__tests__/session-registry.test.ts" for a file that really
+      # lives at "bridge/src/__tests__/...". Resolving that literally reported
+      # MISSING for a file that exists, and the judge dropped that candidate to
+      # last place for "unverifiable claims". Fall back to the basename before
+      # accusing anyone: MISSING must mean no such file exists ANYWHERE.
+      local base matches count
+      base=$(basename "$rel")
+      matches=$(git -C "$wt" ls-files -- "*/$base" "$base" 2>/dev/null | head -3)
+      count=$(printf '%s' "$matches" | grep -c . || true)
+      if [ "${count:-0}" -eq 1 ]; then
+        printf 'EXISTS   %s   (cited as %s; %s lines)\n' \
+          "$matches" "$rel" "$(wc -l < "$wt/$matches" 2>/dev/null | tr -d ' ')"
+      elif [ "${count:-0}" -gt 1 ]; then
+        printf 'AMBIGUOUS %s   (cited path not exact; %s files share this name)\n' "$rel" "$count"
+      elif [ -e "$wt/${rel%%/*}" ]; then
+        printf 'MISSING  %s   (no file of this name exists in this worktree)\n' "$rel"
+      else
+        # The first segment is not even a top-level entry here, so this is a
+        # path into some other tree — an agent citing its own scratch directory
+        # (/Users/.../.gemini/...) was reported MISSING and charged for it.
+        # wtcp has no standing to judge a path outside the worktree.
+        n=$((n-1))
+      fi
     fi
   done
   [ "$total" -le "$max" ] || printf '(%s further cited paths omitted for budget)\n' "$((total-max))"

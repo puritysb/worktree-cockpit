@@ -448,9 +448,19 @@ Findings that cost real round-trips to learn, on
   file, so every competent candidate had to be graded `mixed`. `_claim_path_check`
   resolves the paths a response actually cites against the worktree —
   EXISTS/MISSING, line counts, and `referenced-by-tests` for source modules —
-  and the rubric names it primary evidence. Elided paths (`plugin/.../x.ts`),
-  vendored paths, and bare filenames that do not resolve are skipped, because
-  reporting those MISSING would be wtcp inventing an accusation. It is budgeted
+  and the rubric names it primary evidence. **A false MISSING is worse than no
+  check at all** — it cost a candidate its ranking in a live round: the response
+  had written `bridge/__tests__/session-registry.test.ts` for a file that lives
+  at `bridge/src/__tests__/...`, the literal lookup reported it absent, and the
+  judge dropped that candidate to last place for "unverifiable claims". Before
+  accusing anything, wtcp now falls back to the basename across tracked files
+  (reporting `EXISTS <real path> (cited as <what they wrote>)`), reports
+  AMBIGUOUS when several files share the name, and stays silent when the first
+  path segment is not even a top-level entry — an agent citing its own scratch
+  directory (`/Users/.../.gemini/...`) was being charged for it. Elided paths
+  (`plugin/.../x.ts`), vendored paths, and unresolvable bare filenames are
+  skipped for the same reason. MISSING now means only: no file of this name
+  exists anywhere under a real directory of this worktree. It is budgeted
   out of the same pool as the terminal excerpt. **It did NOT break the score
   compression** (see below); what it did buy is specificity — the judge now
   cites the table and names the exact residual gap ("about 25-30" as an
@@ -486,7 +496,7 @@ send/fork input editing (fourth):
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 162 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 167 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 

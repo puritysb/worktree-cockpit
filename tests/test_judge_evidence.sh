@@ -437,6 +437,23 @@ case "$CLAIMS" in
   *"plugin/.../option.test.ts"*) fail "an elided path is never reported missing" ;;
   *) pass "an elided path is never reported missing" ;;
 esac
+# A false MISSING is worse than no check at all: the judge dropped a candidate
+# to last place for "unverifiable claims" when the file was right there under a
+# path the response had abbreviated for readability.
+ABBREV=$(_claim_path_check "$WT" "see tests/../tests/product.test.ts and product.test.ts" 40)
+SHORTHAND=$(_claim_path_check "$WT" "the helper in wrongdir/product.test.ts is inline" 40)
+has "an abbreviated path resolves by basename" "EXISTS   tests/product.test.ts   (cited as wrongdir/product.test.ts" "$SHORTHAND"
+accusations(){ printf '%s\n' "$1" | grep -cE '^(MISSING|AMBIGUOUS)' | tr -d ' '; }
+[ "$(accusations "$SHORTHAND")" = 0 ] \
+  && pass "an abbreviated path is never accused" || fail "an abbreviated path is never accused"
+# An agent citing its own scratch directory is not this worktree's problem.
+OUTSIDE=$(_claim_path_check "$WT" "wrote it to /Users/me/.gemini/brain/session/report.md" 40)
+[ "$(accusations "$OUTSIDE")" = 0 ] \
+  && pass "a path outside the worktree is not accused" || fail "a path outside the worktree is not accused"
+[ "$(accusations "$CLAIMS")" = 1 ] \
+  && pass "only the genuinely fabricated path is accused" || fail "only the genuinely fabricated path is accused"
+# A genuinely fabricated path under a real top-level entry must still be caught.
+has "a fabricated path under a real directory is still reported" "MISSING  src/nowhere.ts" "$CLAIMS"
 case "$CLAIMS" in
   *node_modules*) fail "vendored paths are ignored" ;;
   *) pass "vendored paths are ignored" ;;
