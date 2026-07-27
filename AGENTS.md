@@ -109,6 +109,18 @@ This file is the design/gotcha memory for working ON wtcp itself.
   Task deductions are removed deterministically, with the adjustment exposed
   in the report; evidence-level caps also synthesize a missing Grounding issue
   ID, and declared hard-cap ID variants are namespaced per dimension.
+  That Task guard matches on ID WORDING and was trivially dodged by naming the
+  rival's finding concretely (`missed_orphan_references` cost two candidates a
+  Task point for a gap the instruction never requested), so
+  `comparative_task_issue` also strips omission-relative IDs
+  (`missed_`/`overlooked_`/`omitted_`/`not_identified_`/`failed_to_identify_`/
+  `less_thorough_`…) UNLESS the ID names a requested item
+  (`requirement`/`requested`/`instruction`/`asked`). Known trade-off: a judge
+  that expresses a genuinely weak candidate's Task gap comparatively gets that
+  deduction refunded, so a thin answer can gain a point — the rubric's own
+  orthogonality rule (Task scores the answer against the timeline, never against
+  rivals) makes that the correct reading, and the fix is a judge that names the
+  absolute defect. Ranking order is unaffected.
   Comparative JSON also requires
   `winner_reason`, `tie_break`, and neutral `summary`. If normalization creates
   a top-score tie after the response, `none`/`not_needed` becomes an explicit
@@ -120,7 +132,27 @@ This file is the design/gotcha memory for working ON wtcp itself.
   both model responses in `~/.config/wtcp/judge-invalid.txt` before comparative
   scoring falls back to independent judging. Independent judging uses the same
   one-repair rule, so never replace strict validation with permissive parsing.
+  **The retry MUST be told what failed.** `_rubric_response_normalize` explains
+  every rejection on stderr (naming the offending field, the candidate for a
+  comparative record, and the computed score); callers capture that text and
+  `_judge_repair_request` puts it at the top of the repair turn, and
+  `_record_invalid_judgment` stores it beside each response. A bare "schema
+  validation failed" is what made Qwen resend byte-identical broken JSON three
+  times in one round — never regress to an unlocated rejection.
   Reports and `@judge_reason` expose both the breakdown and applied `Caps`.
+  Normalization runs BEFORE validation and `repair_feedback` heals the
+  contradictions normalization itself creates: an evidence cap lowers a
+  dimension after the model already wrote `improve_dimension`/`deduction` for
+  the pre-cap score, and the model can never fix that on retry because it is
+  never told the cap fired. Such records are re-targeted (and a `None`
+  deduction filled in), mirroring the existing issue-ID re-targeting; a record
+  whose breakdown wtcp did NOT touch still fails so genuine model errors keep
+  their retry. Every downward adjustment is appended to `normalization_notes`
+  so the report's `Adjustments` line stops reading `none` next to a number the
+  model's own prose contradicts.
+  `cmd_score` ROTATES `judge-invalid.txt` to `judge-invalid.prev.txt` instead of
+  truncating it — a follow-up round used to erase the evidence for the round
+  that motivated it.
   `_wt_evidence` supplies a repository identity hard-gate profile
   (canonical common-git-dir repo name, package, worktree/HEAD, tracked/test
   counts, complete top-level tracked entries). Wrong-repository analysis gets
@@ -347,13 +379,14 @@ under `tests/`. Run them after touching `_workmux_pane_status`,
 file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
 `_in_linked_worktree` (second), or `_round_base_commit`, `_wt_evidence`,
 `_wt_file_patch`, `_terminal_evidence`, `_judge_rubric`,
-`_rubric_response_valid`, judge budgets/prompts (third), or popup
+`_rubric_response_valid`, `_rubric_error_summary`,
+`_rotate_invalid_judgments`, judge budgets/prompts (third), or popup
 send/fork input editing (fourth):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 32 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 114 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 132 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 

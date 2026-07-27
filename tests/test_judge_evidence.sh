@@ -30,8 +30,10 @@ extract_fn(){ # $1 = function name -> print its definition (header line ... clos
   for f in _round_base_commit _diff_base _wt_file_patch _wt_evidence _wt_diff \
            _judge_output_budget _terminal_evidence _judge_rubric _rubric_response_normalize \
            _rubric_response_valid \
+           _rubric_error_summary \
            _judge_single_max_tokens _judge_compare_max_tokens _judge_repair_request \
-           _judge_invalid_file _record_invalid_judgment; do
+           _judge_invalid_file _judge_invalid_prev_file _rotate_invalid_judgments \
+           _record_invalid_judgment; do
     extract_fn "$f"
   done
 } > "$TMP/functions.sh"
@@ -405,6 +407,78 @@ has "invalid response log preserves first response" "bad one" "$INVALID_LOG"
 has "invalid response log preserves repair response" "bad two" "$INVALID_LOG"
 has "fallback report exposes diagnostic path" "Mode: independent fallback" "$(<"$WTCOP")"
 has "fallback respects noninteractive menu setting" '[ "$COCKPIT_NO_INTERACTIVE_MENUS" = "1" ] || _winner_menu "$cwin"' "$(<"$WTCOP")"
+
+echo "T9: actionable rejections and cap-aware normalization"
+# A rejection the model cannot locate is a rejection it cannot fix: Qwen answered
+# a bare "schema validation failed" by resending the identical broken response.
+STRUCT_ERR=$(printf '%s' '{"breakdown":{"task":9,"grounding":3,"verification":2,"actionability":1}}' \
+  | _rubric_response_normalize 0 2>&1 >/dev/null)
+has "structural rejection names the offending field" "breakdown.task must be an integer 0-4" "$STRUCT_ERR"
+has "structural rejection names every missing block" "dimension_reasons must be an object" "$STRUCT_ERR"
+[ "$(printf 'jq: error (at <stdin>:3): improve_dimension is wrong\n' | _rubric_error_summary)" = "improve_dimension is wrong" ] \
+  && pass "error summary strips jq framing" || fail "error summary strips jq framing"
+REPAIRED_WHY=$(printf '%s' "$ORIGINAL_REQ" | _judge_repair_request "$BAD_SUM" 800 "breakdown.task must be an integer 0-4")
+has "repair turn states the concrete reason" "breakdown.task must be an integer 0-4" "$REPAIRED_WHY"
+has "repair turn warns against resending the same text" "rather than resending the same text" "$REPAIRED_WHY"
+
+# wtcp caps the score AFTER the model wrote its feedback, so improve/deduction
+# describe a score that no longer exists. The model is never told the cap fired
+# and cannot repair this; re-target deterministically instead of rejecting.
+CAP_IMPROVE=$(printf '%s' "$GOOD_SINGLE" \
+  | jq -c '.breakdown = {task:4,grounding:3,verification:2,actionability:1}
+      | .evidence_level = "mixed"
+      | .dimension_issue_ids = {task:"none",grounding:"none",verification:"none",actionability:"none"}
+      | .deduction = "quantitative validation is missing"
+      | .improve_dimension = "verification" | .improve = "add quantitative validation"')
+CAP_NORM=$(printf '%s' "$CAP_IMPROVE" | _rubric_response_normalize 0)
+[ "$(printf '%s' "$CAP_NORM" | jq -r '.score')" = 9 ] \
+  && pass "evidence cap lowers the computed score" || fail "evidence cap lowers the computed score"
+[ "$(printf '%s' "$CAP_NORM" | jq -r '.improve_dimension')" = grounding ] \
+  && pass "cap-induced improve mismatch is re-targeted, not rejected" || fail "cap-induced improve mismatch is re-targeted, not rejected"
+has "report exposes the cap-driven lowering" "wtcp adjusted grounding 3->2" "$(printf '%s' "$CAP_NORM" | jq -r '.normalization_notes | join(" ")')"
+CAP_NONE=$(printf '%s' "$CAP_IMPROVE" \
+  | jq -c '.deduction = "None" | .improve = "None" | .improve_dimension = "none"')
+CAP_NONE_NORM=$(printf '%s' "$CAP_NONE" | _rubric_response_normalize 0)
+[ "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.deduction')" != "None" ] \
+  && pass "cap-induced empty deduction is filled in" || fail "cap-induced empty deduction is filled in"
+# A record wtcp did NOT adjust keeps its retry: only self-inflicted mismatches heal.
+UNTOUCHED_MISMATCH=$(printf '%s' "$GOOD_SINGLE" | jq -c '.improve_dimension = "task"')
+printf '%s' "$UNTOUCHED_MISMATCH" | _rubric_response_valid 0 \
+  && fail "untouched improve mismatch still triggers the retry" || pass "untouched improve mismatch still triggers the retry"
+
+# "did not find what a rival found" is a comparative verdict. The old guard
+# matched on ID wording, so a concretely-named rival finding walked straight
+# through and cost two candidates a Task point for an unrequested gap.
+COMPARATIVE_TASK=$(printf '%s' "$NO_SCORE" \
+  | jq -c '.dimension_issue_ids.task = "missed_orphan_references"
+      | .dimension_reasons.task = "did not identify the structural defect the winner found"')
+COMPARATIVE_NORM=$(printf '%s' "$COMPARATIVE_TASK" | _rubric_response_normalize 0)
+[ "$(printf '%s' "$COMPARATIVE_NORM" | jq -r '.breakdown.task')" = 4 ] \
+  && pass "concretely-named comparative Task deduction is removed" || fail "concretely-named comparative Task deduction is removed"
+has "comparative removal is explained in the report" "Removed comparative-only Task deduction" \
+  "$(printf '%s' "$COMPARATIVE_NORM" | jq -r '.normalization_notes | join(" ")')"
+REQUESTED_OMISSION=$(printf '%s' "$NO_SCORE" | jq -c '.dimension_issue_ids.task = "missed_requested_benchmark"')
+[ "$(printf '%s' "$REQUESTED_OMISSION" | _rubric_response_normalize 0 | jq -r '.breakdown.task')" = 3 ] \
+  && pass "omission of a requested item stays a real Task deduction" || fail "omission of a requested item stays a real Task deduction"
+
+BAD_CANDIDATE=$(printf '%s' "$GOOD_COMPARE" | jq -c '.rankings[1].breakdown.grounding = 7')
+CMP_ERR=$(printf '%s' "$BAD_CANDIDATE" | _rubric_response_normalize 2 '["a","b"]' 2>&1 >/dev/null)
+has "comparative rejection names the candidate" "b: breakdown.grounding must be an integer 0-3" "$CMP_ERR"
+CMP_COUNT_ERR=$(printf '%s' "$GOOD_COMPARE" | _rubric_response_normalize 3 '["a","b","c"]' 2>&1 >/dev/null)
+has "comparative rejection names the count mismatch" "exactly 3 records" "$CMP_COUNT_ERR"
+
+OLD_HOME="$HOME"
+HOME="$TMP/home-rotate"; export HOME
+mkdir -p "$HOME/.config/wtcp"
+printf 'round one diagnostic\n' > "$(_judge_invalid_file)"
+_rotate_invalid_judgments
+ROTATED_PREV=$(<"$(_judge_invalid_prev_file)")
+ROTATED_CUR=$(<"$(_judge_invalid_file)")
+HOME="$OLD_HOME"; export HOME
+has "rotation preserves the previous round's diagnostic" "round one diagnostic" "$ROTATED_PREV"
+[ -z "$ROTATED_CUR" ] \
+  && pass "rotation starts the new round empty" || fail "rotation starts the new round empty"
+has "score rotates instead of truncating" "_rotate_invalid_judgments" "$(<"$WTCOP")"
 
 echo
 echo "results: $PASS passed, $FAIL failed"
