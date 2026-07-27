@@ -1475,6 +1475,7 @@ Classify the evidence for central claims:
 - direct: every central factual/numeric claim is supported by visible raw command/test output or a visible source/config excerpt. An agent-authored conclusion, an exact-looking number, a path citation, a pass count, or a claim marked "verified" is not direct evidence by itself.
 - mixed: repository identity and some central claims have direct support, but at least one central conclusion relies on agent-authored narrative, inference, or an unseen command result. Grounding is at most 2 and wtcp caps the total at 9.
 - narrative_only: central conclusions rely on the agent's narrative without visible primary support. Grounding is at most 1 and wtcp caps the total at 8.
+Classify by the evidence behind the claims that ANSWER THE INSTRUCTION, not by incidental command output the candidate happened to run. A visible test run supports "the suite currently passes"; it is not support for a claim about whether the test set is well composed. If the deliverable is an assessment and the assessment itself rests on the candidate's narrative, the level is narrative_only even when unrelated commands are visible.
 Use the candidate's evidence, not confidence or precision, for this classification. Score 10 is exceptional: evidence_level must be direct, every explicit requirement must be fulfilled, no material uncertainty may remain, and every dimension must independently deserve its maximum.
 
 Apply these hard gates before ranking. Record every applied gate by its exact ID in the output caps array; use [] when none apply. Choose dimension scores consistent with the cap. As a schema safeguard, wtcp lowers the relevant dimensions deterministically when a declared cap would otherwise be exceeded, so the displayed final score always equals the displayed breakdown sum:
@@ -1679,6 +1680,31 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
               + "); the prose below may still describe the pre-adjustment value.")
           ]
         end;
+    # Charging one root cause to several dimensions is a real defect, but
+    # REJECTING it is worse than recording it: told exactly which IDs collide,
+    # the judge resends the identical record, so the round burns its one repair
+    # and drops into independent judging (which scores far worse). Namespace the
+    # collision per dimension the way cap-derived IDs already are, and say so in
+    # the report so the shared root cause stays visible to the reader.
+    def dedupe_issue_ids:
+      . as $rec
+      | (["task", "grounding", "verification", "actionability"]
+         | map(select($rec.breakdown[.] < dim_max(.)))) as $deducted
+      | ([$deducted[] | $rec.dimension_issue_ids[.]]) as $ids
+      | ($ids | group_by(.) | map(select(length > 1) | .[0])) as $shared
+      | if ($shared | length) == 0 then .
+        else
+          reduce $deducted[] as $field (.;
+            if (($shared | index($rec.dimension_issue_ids[$field])) != null)
+               and (($rec.dimension_issue_ids[$field] | endswith("_" + $field)) | not)
+            then .dimension_issue_ids[$field] = ($rec.dimension_issue_ids[$field] + "_" + $field)
+            else . end)
+          | .normalization_notes += [
+              ("One issue was charged in several dimensions and has been namespaced per dimension ["
+                + ($shared | join(", "))
+                + "]; read the shared root cause as a single weakness.")
+            ]
+        end;
     def normalize:
       .breakdown as $raw_breakdown
       | ._raw_breakdown = $raw_breakdown
@@ -1711,6 +1737,7 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
       | normalize_issue_id("grounding"; 3)
       | normalize_issue_id("verification"; 2)
       | normalize_issue_id("actionability"; 1)
+      | dedupe_issue_ids
       | note_wtcp_adjustments($raw_breakdown);
     def improvement_valid:
       if .score == 10 then
@@ -1757,14 +1784,15 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
         | if $target == null then .
           else
             .improve_dimension = $target
+            # Never invent replacement prose: the report language is inferred by
+            # the model from the instruction timeline and is unknown here, so a
+            # synthesized English sentence lands in the middle of a Korean
+            # report. Reuse the judge own sentence about the capped dimension.
             | (if (.deduction | ascii_downcase) == "none" or (.deduction | length) == 0
-               then .deduction = ("Capped by "
-                 + (if (.caps | length) == 0 then "normalization" else (.caps | join(", ")) end)
-                 + ": the judgment claimed no deduction before wtcp applied the evidence limit.")
+               then .deduction = .dimension_reasons[$target]
                else . end)
             | (if (.improve | ascii_downcase) == "none" or (.improve | length) == 0
-               then .improve = ("Show visible primary evidence for the central claims so "
-                 + $target + " can reach full credit.")
+               then .improve = .dimension_reasons[$target]
                else . end)
             | .normalization_notes += [
                 ("Re-targeted improve_dimension to " + $target
@@ -1843,6 +1871,24 @@ _rubric_error_summary(){   # stdin=captured stderr -> one actionable line for th
   printf '%.600s' "$line"
 }
 
+_judge_error_excerpt(){   # $1=response $2=error text -> numbered lines around the failure
+  # jq reports "line 30, column 1" and the model has repeatedly proved it cannot
+  # act on a coordinate alone (same duplicated-key break at line 30, resent
+  # verbatim). Quote its own bytes back at it instead.
+  local resp="${1:-}" err="${2:-}" line
+  line=$(printf '%s' "$err" | sed -n 's/.*line \([0-9][0-9]*\).*/\1/p' | head -1)
+  [ -n "$line" ] || return 0
+  printf '%s' "$resp" | awk -v n="$line" 'NR >= n-3 && NR <= n+2 { printf "%d: %s\n", NR, $0 }'
+}
+_judge_rejection_detail(){   # $1=response $2=error summary -> reason plus the offending excerpt
+  local resp="${1:-}" why="${2:-}" excerpt
+  excerpt=$(_judge_error_excerpt "$resp" "$why")
+  if [ -n "$excerpt" ]; then
+    printf '%s\nThese are the offending lines of your previous response:\n%s' "$why" "$excerpt"
+  else
+    printf '%s' "$why"
+  fi
+}
 _judge_single_max_tokens(){ printf '1000'; }
 _judge_compare_max_tokens(){   # $1=candidate count; enough room for every rubric record
   local count="${1:-1}" tokens
@@ -1986,6 +2032,8 @@ _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $
   else
     first_resp="$resp"
     first_err=$(_rubric_error_summary < "$rubric_errf")
+
+    first_err=$(_judge_rejection_detail "$resp" "$first_err")
     repair_req=$(printf '%s' "$req" | _judge_repair_request "$resp" "$max_tokens" "$first_err")
     raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
     repaired_model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
@@ -2245,6 +2293,8 @@ cmd_score(){
   else
     first_resp="$resp"
     first_err=$(_rubric_error_summary < "$rubric_errf")
+
+    first_err=$(_judge_rejection_detail "$resp" "$first_err")
     repair_req=$(printf '%s' "$req" | _judge_repair_request "$resp" "$max_tokens" "$first_err")
     raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
     repaired_model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)

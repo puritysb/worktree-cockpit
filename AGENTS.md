@@ -153,6 +153,9 @@ This file is the design/gotcha memory for working ON wtcp itself.
   `cmd_score` ROTATES `judge-invalid.txt` to `judge-invalid.prev.txt` instead of
   truncating it — a follow-up round used to erase the evidence for the round
   that motivated it.
+  Measured against the real Qwen judge on one fixed 3-candidate round (see
+  "Tuning the judge empirically" below), those changes took first-try validity
+  from 1/5 to 5/6 and usable rounds from 3/5 to 6/6.
   `_wt_evidence` supplies a repository identity hard-gate profile
   (canonical common-git-dir repo name, package, worktree/HEAD, tracked/test
   counts, complete top-level tracked entries). Wrong-repository analysis gets
@@ -371,6 +374,41 @@ endpoints; namer reuses it by default via `COCKPIT_NAMER_AUTH`), `COCKPIT_JUDGE_
 scoring; headless/tests).
 Misc: `COCKPIT_INVOKE` (keybinding callback command), `WTCP_CONFIG` (config path).
 
+## Tuning the judge empirically
+
+Rubric changes must be MEASURED, not reasoned about — every plausible-sounding
+change in this area has been wrong at least once. Capture one real round's
+evidence blocks (`_wt_diff` + `_terminal_evidence` per pane, exactly as
+`cmd_score` builds them), then replay that fixed payload against the judge N
+times per variant and count: first-try validity, rounds that produce any usable
+report, per-candidate score spread, and whether the ranking order inverts. One
+sample proves nothing; the same input has scored one candidate 3 and 9.
+
+Findings that cost real round-trips to learn, on
+`mlx-community/Qwen3.6-35B-A3B-4bit`:
+
+- **Clerical rejections are not repairable; judgment is sound.** Breakdown and
+  ranking order were sane in essentially every sample. The failures were
+  bookkeeping — duplicate issue IDs, a stray brace, feedback fields that
+  contradict a cap. Prefer deterministic normalization over rejection for
+  anything clerical; reserve rejection for what changes the verdict.
+- **A rejection needs the offending BYTES, not a coordinate.** "line 30,
+  column 1" produced a byte-identical resend more than once; quoting the
+  surrounding lines back (`_judge_error_excerpt`) recovers it.
+- **Never offer an escape hatch in an error message.** A strict pre-check that
+  bounced `evidence_level: mixed` alongside `grounding: 3` suggested "or
+  classify the evidence as direct" — the judge took that option and handed two
+  candidates 10/10. The check was reverted; wtcp caps leniently instead.
+- **Never synthesize report prose.** The report language is inferred by the
+  model from the instruction timeline and is unknown to wtcp, so an invented
+  English sentence lands inside a Korean report. `repair_feedback` reuses the
+  judge's own `dimension_reasons[target]`.
+- **Evidence level must be judged on the claims that ANSWER the instruction.**
+  A narrative candidate that happened to run `pnpm test` oscillated between
+  `mixed` and `narrative_only` (a 1-2 point swing that inverted the ranking
+  once). Saying explicitly that incidental command output does not ground an
+  assessment pinned it to `narrative_only` in 5/5 and removed the inversion.
+
 ## Testing wtcp without real agents
 
 Fast unit-style regression tests (no real agents/tmux/workmux pollution) live
@@ -380,13 +418,14 @@ file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
 `_in_linked_worktree` (second), or `_round_base_commit`, `_wt_evidence`,
 `_wt_file_patch`, `_terminal_evidence`, `_judge_rubric`,
 `_rubric_response_valid`, `_rubric_error_summary`,
-`_rotate_invalid_judgments`, judge budgets/prompts (third), or popup
+`_judge_error_excerpt`, `_rotate_invalid_judgments`, judge budgets/prompts
+(third), or popup
 send/fork input editing (fourth):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 32 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 132 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 141 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 

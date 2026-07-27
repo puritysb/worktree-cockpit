@@ -30,7 +30,7 @@ extract_fn(){ # $1 = function name -> print its definition (header line ... clos
   for f in _round_base_commit _diff_base _wt_file_patch _wt_evidence _wt_diff \
            _judge_output_budget _terminal_evidence _judge_rubric _rubric_response_normalize \
            _rubric_response_valid \
-           _rubric_error_summary \
+           _rubric_error_summary _judge_error_excerpt _judge_rejection_detail \
            _judge_single_max_tokens _judge_compare_max_tokens _judge_repair_request \
            _judge_invalid_file _judge_invalid_prev_file _rotate_invalid_judgments \
            _record_invalid_judgment; do
@@ -274,8 +274,18 @@ printf '%s' "$NONE_DEDUCTION" | _rubric_response_valid 0 \
 DUPLICATE_ISSUE=$(printf '%s' '{"breakdown":{"task":3,"grounding":3,"verification":1,"actionability":1},"caps":[]}' \
   | with_audit \
   | jq -c '.dimension_issue_ids.task = "same_issue" | .dimension_issue_ids.verification = "same_issue"')
-printf '%s' "$DUPLICATE_ISSUE" | _rubric_response_valid 0 \
-  && fail "one issue cannot be charged to two dimensions" || pass "one issue cannot be charged to two dimensions"
+# Rejecting a double-charge costs the round: told exactly which IDs collide, the
+# judge resends the identical record and the fallback scores far worse. Record it
+# instead — namespaced per dimension, with the shared root cause called out.
+DEDUPED=$(printf '%s' "$DUPLICATE_ISSUE" | _rubric_response_normalize 0)
+[ -n "$DEDUPED" ] \
+  && pass "a double-charged issue no longer kills the round" || fail "a double-charged issue no longer kills the round"
+[ "$(printf '%s' "$DEDUPED" | jq -r '.dimension_issue_ids.task')" = "same_issue_task" ] \
+  && pass "double-charged issue IDs are namespaced per dimension" || fail "double-charged issue IDs are namespaced per dimension"
+[ "$(printf '%s' "$DEDUPED" | jq -r '.dimension_issue_ids.verification')" = "same_issue_verification" ] \
+  && pass "every colliding dimension gets its own namespaced id" || fail "every colliding dimension gets its own namespaced id"
+has "the shared root cause stays visible in the report" "charged in several dimensions" \
+  "$(printf '%s' "$DEDUPED" | jq -r '.normalization_notes | join(" ")')"
 MISPLACED_TASK=$(printf '%s' "$NO_SCORE" \
   | jq -c '.dimension_issue_ids.task = "unverified_documentation_claim"
     | .improve_dimension = "grounding" | .improve = "show direct evidence"')
@@ -417,6 +427,17 @@ has "structural rejection names the offending field" "breakdown.task must be an 
 has "structural rejection names every missing block" "dimension_reasons must be an object" "$STRUCT_ERR"
 [ "$(printf 'jq: error (at <stdin>:3): improve_dimension is wrong\n' | _rubric_error_summary)" = "improve_dimension is wrong" ] \
   && pass "error summary strips jq framing" || fail "error summary strips jq framing"
+# A coordinate alone is not actionable: the judge answered "line 30, column 1"
+# by resending the identical broken JSON. Quote its own bytes back at it.
+BROKEN_LINES=$(printf 'a\nb\nc\nd\ne\nf\ng\nh\n')
+EXCERPT=$(_judge_error_excerpt "$BROKEN_LINES" "parse error: something at line 5, column 1")
+has "excerpt includes the reported line" "5: e" "$EXCERPT"
+has "excerpt includes preceding context" "2: b" "$EXCERPT"
+has "excerpt includes trailing context" "7: g" "$EXCERPT"
+[ -z "$(_judge_error_excerpt "$BROKEN_LINES" "no coordinate here")" ] \
+  && pass "a rejection without a line number adds no excerpt" || fail "a rejection without a line number adds no excerpt"
+has "rejection detail carries the excerpt" "These are the offending lines" \
+  "$(_judge_rejection_detail "$BROKEN_LINES" "parse error: something at line 5, column 1")"
 REPAIRED_WHY=$(printf '%s' "$ORIGINAL_REQ" | _judge_repair_request "$BAD_SUM" 800 "breakdown.task must be an integer 0-4")
 has "repair turn states the concrete reason" "breakdown.task must be an integer 0-4" "$REPAIRED_WHY"
 has "repair turn warns against resending the same text" "rather than resending the same text" "$REPAIRED_WHY"
@@ -439,8 +460,16 @@ has "report exposes the cap-driven lowering" "wtcp adjusted grounding 3->2" "$(p
 CAP_NONE=$(printf '%s' "$CAP_IMPROVE" \
   | jq -c '.deduction = "None" | .improve = "None" | .improve_dimension = "none"')
 CAP_NONE_NORM=$(printf '%s' "$CAP_NONE" | _rubric_response_normalize 0)
-[ "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.deduction')" != "None" ] \
-  && pass "cap-induced empty deduction is filled in" || fail "cap-induced empty deduction is filled in"
+# Never synthesize prose: the report language is inferred by the model from the
+# instruction timeline, so an invented English sentence lands inside a Korean
+# report. Reuse the judge's own sentence about the capped dimension instead.
+[ "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.deduction')" \
+  = "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.dimension_reasons.grounding')" ] \
+  && pass "cap-induced empty deduction reuses the judge's own wording" || fail "cap-induced empty deduction reuses the judge's own wording"
+case "$(printf '%s' "$CAP_NONE_NORM" | jq -r '.deduction')" in
+  "Capped by"*|"wtcp"*) fail "wtcp never writes report prose itself" ;;
+  *) pass "wtcp never writes report prose itself" ;;
+esac
 # A record wtcp did NOT adjust keeps its retry: only self-inflicted mismatches heal.
 UNTOUCHED_MISMATCH=$(printf '%s' "$GOOD_SINGLE" | jq -c '.improve_dimension = "task"')
 printf '%s' "$UNTOUCHED_MISMATCH" | _rubric_response_valid 0 \
