@@ -2102,6 +2102,26 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
           and (.tie_break | type == "string" and length > 0)
           and (.summary | type == "string" and length > 0))
       then .rankings |= map(. as $record | try normalize_checked catch error($record.name + ": " + .))
+        # Comparative judging exists to DISCRIMINATE, so a record whose
+        # evaluation sentences are byte-identical to a rival record is not
+        # a judgment of that candidate — it is a copy. Observed: agy carried
+        # the Actionability reason, deduction and improvement of opencode
+        # while scoring two points lower. wtcp cannot tell which reading was
+        # real, so it flags rather than edits, and the reader can discount it.
+        | ([.rankings[] | (.dimension_reasons | to_entries | map(.value))
+              + [.strength, .deduction, .improve]]
+           | flatten
+           | map(select(type == "string" and (length > 0) and (ascii_downcase != "none")))
+           | group_by(.) | map(select(length > 1) | .[0])) as $shared
+        | .rankings |= map(
+            ((((.dimension_reasons | to_entries | map(.value)) + [.strength, .deduction, .improve])
+              | map(select(. as $t | ($shared | index($t)) != null))) | length) as $n
+            | if $n >= 3 then
+                .normalization_notes = (.normalization_notes // []) + [
+                  ("Shares " + ($n | tostring)
+                    + " evaluation sentences verbatim with another candidate; this record may not be an independent reading.")
+                ]
+              else . end)
         | ([.rankings[].score] | max) as $top
         | if (.winner as $w | any(.rankings[]; .name == $w and .score == $top))
           then ([.rankings[] | select(.score == $top)] | length) as $ties

@@ -353,6 +353,31 @@ TIED_NO_REASON=$(printf '%s' '{"rankings":[{"name":"a","breakdown":{"task":4,"gr
   | with_audit | jq -c '.tie_break = "not_needed"')
 NORMALIZED_TIE=$(printf '%s' "$TIED_NO_REASON" | _rubric_response_normalize 2)
 has "post-normalization tie gets explicit judge-preference note" "Top absolute scores are tied" "$NORMALIZED_TIE"
+# Comparative judging exists to discriminate, so a record whose evaluation
+# sentences are byte-identical to a rival is a copy, not a reading of that
+# candidate. Observed live: agy carried the Actionability reason, deduction and
+# improvement of opencode verbatim while scoring two points lower.
+SHARED_TEXT="보완해야 할 항목들이 구조적으로 명확히 제시되어 있음."
+COPIED_RECORDS=$(printf '%s' "$GOOD_COMPARE" | jq -c --arg t "$SHARED_TEXT" '
+  .rankings |= map(.dimension_reasons.actionability = $t | .deduction = ($t + " 2") | .improve = ($t + " 3"))')
+COPIED_NORM=$(printf '%s' "$COPIED_RECORDS" | _rubric_response_normalize 2 '["a","b"]')
+[ "$(printf '%s' "$COPIED_NORM" | jq '[.rankings[] | select((.normalization_notes // []) | join(" ") | test("verbatim"))] | length')" = 2 ] \
+  && pass "records copied from a peer are flagged" || fail "records copied from a peer are flagged"
+# with_audit gives every record the same boilerplate prose, so the negative case
+# needs text that actually differs per candidate.
+UNIQUE_RECORDS=$(printf '%s' "$GOOD_COMPARE" | jq -c '
+  .rankings |= map(.name as $n
+    | .dimension_reasons |= with_entries(.value = (.key + " for " + $n))
+    | .strength = ("strength of " + $n)
+    | .deduction = (if .deduction == "None" then "None" else "deduction for " + $n end)
+    | .improve = (if .improve == "None" then "None" else "improvement for " + $n end))')
+UNIQUE_NORM=$(printf '%s' "$UNIQUE_RECORDS" | _rubric_response_normalize 2 '["a","b"]')
+[ "$(printf '%s' "$UNIQUE_NORM" | jq '[.rankings[] | select((.normalization_notes // []) | join(" ") | test("verbatim"))] | length')" = 0 ] \
+  && pass "independently written records are not flagged" || fail "independently written records are not flagged"
+# Flag, never edit: wtcp cannot tell which of the two readings was the real one.
+[ "$(printf '%s' "$COPIED_NORM" | jq -r '[.rankings[].score] | join(",")')" \
+  = "$(printf '%s' "$GOOD_COMPARE" | _rubric_response_normalize 2 '["a","b"]' | jq -r '[.rankings[].score] | join(",")')" ] \
+  && pass "flagging a copy never changes a score" || fail "flagging a copy never changes a score"
 COPIED_SUMMARY=$(printf '%s' "$GOOD_COMPARE" | jq -c '.summary = .winner_reason')
 printf '%s' "$COPIED_SUMMARY" | _rubric_response_valid 2 \
   && pass "duplicate summary remains structurally valid" || fail "duplicate summary remains structurally valid"

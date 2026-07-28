@@ -512,6 +512,15 @@ Findings that cost real round-trips to learn, on
   Measured 9/9 for the top two in 4/4 samples afterwards. The synthesized
   tie-break names a reason, and two close answers tying is arguably correct —
   do not "fix" this by raising the cap, which would gut the evidence gate.
+- **A record copied from a peer is not a judgment of that candidate.** Observed
+  live: agy carried the Actionability reason, deduction and improvement of
+  opencode verbatim while scoring two points lower — comparative judging exists
+  to discriminate, so identical prose means that candidate was not actually
+  read. Normalization flags any record sharing >= 3 evaluation sentences
+  verbatim with another (exact string equality, so it is language-independent)
+  and says so in `Adjustments`. It FLAGS and never edits: wtcp cannot tell which
+  of the two readings was the real one, and scores are untouched. Intermittent —
+  it did not reproduce in the next three samples — so treat it as a monitor.
 - **Some judge errors are content misreadings that no guard can catch.** A
   candidate that listed concrete P0/P1 items with file names and line numbers
   was charged Task 2/4 because its CLOSING line offered to save the findings to
@@ -545,7 +554,7 @@ send/fork input editing (fourth), or `_scored_winner`/`_winner_menu`/`cmd_merge`
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 182 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 185 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 bash tests/test_judge_mode.sh        # 12 assertions; fallback scores never pick a winner
 ```
