@@ -121,6 +121,16 @@ This file is the design/gotcha memory for working ON wtcp itself.
   orthogonality rule (Task scores the answer against the timeline, never against
   rivals) makes that the correct reading, and the fix is a judge that names the
   absolute defect. Ranking order is unaffected.
+  **An ID-wording guard is permanently dodgeable.** Three different innocuous
+  IDs have now carried a purely comparative Task deduction —
+  `missed_orphan_references`, `lack_of_concrete_evidence`,
+  `incomplete_improvement_details` — because the comparison lives in the PROSE
+  ("somewhat weaker than the former one"), not in the name. A prose check
+  cannot be deterministic: dimension_reasons are written in whatever language
+  the model inferred from the timeline. The rubric therefore also demands
+  self-contained dimension_reasons. Treat the residual as a known one-point
+  wobble on non-winning candidates; do NOT widen the ID regex, which would
+  start refunding real Task defects.
   Comparative JSON also requires
   `winner_reason`, `tie_break`, and neutral `summary`. If normalization creates
   a top-score tie after the response, `none`/`not_needed` becomes an explicit
@@ -496,7 +506,7 @@ send/fork input editing (fourth):
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 167 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 169 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 
