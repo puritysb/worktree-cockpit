@@ -582,6 +582,7 @@ All settings live in `~/.config/wtcp/config` (sourced shell vars). See
 | `COCKPIT_LAUNCH_TIMEOUT` | `0` | seconds to wait for agent windows; `0` auto-scales for slow cold worktree hooks |
 | `COCKPIT_STATUS` | `1` | live 🤖/💬/✅ status on grid pane borders, read from workmux's per-pane state (`0` disables) |
 | `COCKPIT_STATUS_INTERVAL` | `3` | status poll interval (seconds) |
+| `COCKPIT_TEAMMATE_ENV` | `1` | publish the round's agent `env:` to the tmux session so sub-panes an agent spawns itself (Claude Code's `teammateMode`) inherit its credentials; cleared by `wtcp clean`. The values become readable by anything in that tmux server — `0` opts out, and `wtcp doctor` names the variables involved |
 | `COCKPIT_POPUP_WIDTH` / `COCKPIT_POPUP_HEIGHT` | `92%` / `85%` | tmux popup size for judge details |
 | `COCKPIT_POPUP_DIM` / `COCKPIT_POPUP_DIM_STYLE` | `1` / `fg=colour244,bg=colour235` | dim pane styles behind popups; tmux has no true blur/backdrop |
 | `COCKPIT_NAMER` | `fm` | branch naming: `fm` (Apple Intelligence) / `mlx` / `off` |
