@@ -437,6 +437,16 @@ sample proves nothing; the same input has scored one candidate 3 and 9.
 Findings that cost real round-trips to learn, on
 `mlx-community/Qwen3.6-35B-A3B-4bit`:
 
+- **Repair ALL bookkeeping; reject only what changes a verdict.** `repair_feedback`
+  fixes a stray/missing/misaimed `improve_dimension`, a deduction stated as
+  `None` below 10, and an improvement with no deduction — whether or not wtcp
+  itself caused the mismatch. It used to reject a mismatch wtcp had not caused,
+  on the theory that a model error is the model's to fix; the measurement says
+  otherwise. A live round died exactly this way: opencode scored 4/2/2/1 with
+  `improve_dimension: "none"`, the repair turn returned the same record, and the
+  round fell into independent judging, which then scored all three candidates
+  9/10. None of these repairs move a score — they are pure bookkeeping — so the
+  cost of rejecting is the whole round and the benefit is zero.
 - **Clerical rejections are not repairable; judgment is sound.** Breakdown and
   ranking order were sane in essentially every sample. The failures were
   bookkeeping — duplicate issue IDs, a stray brace, feedback fields that
@@ -502,6 +512,16 @@ Findings that cost real round-trips to learn, on
   Measured 9/9 for the top two in 4/4 samples afterwards. The synthesized
   tie-break names a reason, and two close answers tying is arguably correct —
   do not "fix" this by raising the cap, which would gut the evidence gate.
+- **Some judge errors are content misreadings that no guard can catch.** A
+  candidate that listed concrete P0/P1 items with file names and line numbers
+  was charged Task 2/4 because its CLOSING line offered to save the findings to
+  memory or start fixing — the judge read the offer as the deliverable being
+  deferred, which the rubric explicitly forbids. The anchor gate cannot help:
+  the judge quoted a real requirement and phrased the deduction absolutely; it
+  was simply wrong about the content. Sharpening the rubric ("judge the BODY,
+  not the closing sentence") fixed it in only 1 of 3 samples. Recorded as a
+  model-capability limit, not a pipeline defect — the ranking of the other
+  candidates stayed stable across every sample.
 - **Evidence level must be judged on the claims that ANSWER the instruction.**
   A narrative candidate that happened to run `pnpm test` oscillated between
   `mixed` and `narrative_only` (a 1-2 point swing that inverted the ranking
@@ -525,7 +545,7 @@ send/fork input editing (fourth), or `_scored_winner`/`_winner_menu`/`cmd_merge`
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 177 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 182 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 bash tests/test_judge_mode.sh        # 12 assertions; fallback scores never pick a winner
 ```

@@ -194,6 +194,9 @@ has "rubric defines direct evidence narrowly" "agent-authored conclusion" "$RUBR
 has "rubric makes ten exceptional" "Score 10 is exceptional" "$RUBRIC"
 has "unverified facts do not reduce task" "affects Grounding and/or Verification, not Task" "$RUBRIC"
 has "optional implementation offer is not penalized" "brief optional offer to implement next steps" "$RUBRIC"
+# Observed: a fully specified P0/P1 list (file names, line numbers) was charged
+# Task 2/4 because the closing line offered to save it to memory or start fixing.
+has "the closing line is not the deliverable" "Judge the BODY of the answer, not its closing sentence" "$RUBRIC"
 has "timeline alone defines user requirements" "Instruction timeline is the only authoritative user specification" "$RUBRIC"
 
 with_audit(){
@@ -267,16 +270,27 @@ printf '%s' "$MISSING_AUDIT" | _rubric_response_valid 0 \
 FULL_DIM_IMPROVE=$(printf '%s' '{"breakdown":{"task":4,"grounding":3,"verification":2,"actionability":1},"caps":[]}' \
   | with_audit \
   | jq -c '.improve_dimension = "actionability" | .improve = "raise an already maxed dimension"')
-printf '%s' "$FULL_DIM_IMPROVE" | _rubric_response_valid 0 \
-  && fail "improvement cannot target a full-credit dimension" || pass "improvement cannot target a full-credit dimension"
+# Bookkeeping is repaired, never rejected: the repair turn does not clear these
+# (measured), so rejecting cost the whole round and dropped it into independent
+# judging, which scores every candidate 9/10.
+FULL_DIM_FIXED=$(printf '%s' "$FULL_DIM_IMPROVE" | _rubric_response_normalize 0)
+[ "$(printf '%s' "$FULL_DIM_FIXED" | jq -r '.improve_dimension')" = none ] \
+  && pass "a perfect record has its stray improvement cleared" || fail "a perfect record has its stray improvement cleared"
+has "clearing a stray improvement is recorded" "every dimension reached full credit" \
+  "$(printf '%s' "$FULL_DIM_FIXED" | jq -r '.normalization_notes | join(" ")')"
 STRAY_FULL_ID=$(printf '%s' '{"breakdown":{"task":4,"grounding":3,"verification":2,"actionability":1},"caps":[]}' \
   | with_audit | jq -c '.dimension_issue_ids.verification = "stale_verification_issue"')
 NORMALIZED=$(printf '%s' "$STRAY_FULL_ID" | _rubric_response_normalize 0)
 [ "$(printf '%s' "$NORMALIZED" | jq -r '.dimension_issue_ids.verification')" = none ] \
   && pass "full-credit dimension issue ID is cleared" || fail "full-credit dimension issue ID is cleared"
 NONE_DEDUCTION=$(printf '%s' "$GOOD_SINGLE" | jq -c '.deduction = "None"')
-printf '%s' "$NONE_DEDUCTION" | _rubric_response_valid 0 \
-  && fail "sub-ten score cannot claim no deduction" || pass "sub-ten score cannot claim no deduction"
+# A judge that states no deduction below 10 is describing a cap, not a defect.
+# wtcp must not invent the missing sentence — Caps/Adjustments explain it.
+NONE_FIXED=$(printf '%s' "$NONE_DEDUCTION" | _rubric_response_normalize 0)
+[ "$(printf '%s' "$NONE_FIXED" | jq -r '.deduction')" = "None" ] \
+  && pass "a sub-ten score with no stated deduction keeps none" || fail "a sub-ten score with no stated deduction keeps none"
+has "the missing deduction is explained, not fabricated" "Score limited by the applied cap" \
+  "$(printf '%s' "$NONE_FIXED" | jq -r '.normalization_notes | join(" ")')"
 DUPLICATE_ISSUE=$(printf '%s' '{"breakdown":{"task":3,"grounding":3,"verification":1,"actionability":1},"caps":[]}' \
   | with_audit \
   | jq -c '.dimension_issue_ids.task = "same_issue" | .dimension_issue_ids.verification = "same_issue"')
@@ -625,10 +639,18 @@ case "$TIE_TEXT" in
   *"$(printf '%s' "$NORMALIZED_TIE" | jq -r '.winner_reason')"*) fail "the tie-break does not repeat the winner rationale" ;;
   *) pass "the tie-break does not repeat the winner rationale" ;;
 esac
-# A record wtcp did NOT adjust keeps its retry: only self-inflicted mismatches heal.
+# This used to keep its retry on the theory that a model error should be the
+# model's to fix. The measurement says otherwise: the retry returns the same
+# record, and the round then falls to independent judging. Repair it here.
 UNTOUCHED_MISMATCH=$(printf '%s' "$GOOD_SINGLE" | jq -c '.improve_dimension = "task"')
-printf '%s' "$UNTOUCHED_MISMATCH" | _rubric_response_valid 0 \
-  && fail "untouched improve mismatch still triggers the retry" || pass "untouched improve mismatch still triggers the retry"
+UNTOUCHED_FIXED=$(printf '%s' "$UNTOUCHED_MISMATCH" | _rubric_response_normalize 0)
+[ -n "$UNTOUCHED_FIXED" ] \
+  && pass "a mismatch wtcp did not cause is repaired too" || fail "a mismatch wtcp did not cause is repaired too"
+[ "$(printf '%s' "$UNTOUCHED_FIXED" | jq -r '.improve_dimension')" = verification ] \
+  && pass "the repair picks a genuinely below-maximum dimension" || fail "the repair picks a genuinely below-maximum dimension"
+# The scores themselves are never touched by any of this.
+[ "$(printf '%s' "$UNTOUCHED_FIXED" | jq -r '.score')" = "$(printf '%s' "$GOOD_SINGLE" | jq -r '.score')" ] \
+  && pass "bookkeeping repair never moves a score" || fail "bookkeeping repair never moves a score"
 
 # "did not find what a rival found" is a comparative verdict. The old guard
 # matched on ID wording, so a concretely-named rival finding walked straight
