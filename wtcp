@@ -2462,7 +2462,12 @@ _agent_menu(){   # $1=grid window $2=menu title $3=verb (pick|diff)
   items+=("" "" "" "Cancel" q "")
   tmux display-menu -T "$title" "${items[@]}" 2>/dev/null || true
 }
-_winner_menu(){ _agent_menu "$1" "wtcp — pick winner to merge" pick; }
+_winner_menu(){
+  local title="wtcp — pick winner to merge"
+  [ "$(tmux show-options -wqv -t "$1" @cockpit_judge_mode 2>/dev/null || true)" = independent ] \
+    && title="wtcp — MANUAL pick (independent scores are not comparable)"
+  _agent_menu "$1" "$title" pick
+}
 _diff_menu(){   _agent_menu "$1" "wtcp — view agent diff" diff; }
 _keep_menu(){   _agent_menu "$1" "wtcp — keep agent session (no merge)" keep; }
 # The judge's winner, read from the scored pane borders: the 🏆-marked pane
@@ -2475,6 +2480,11 @@ _scored_winner(){   # $1=grid window -> worktree name or ""
     label=$(tmux show-options -pqv -t "$p" @pane_label 2>/dev/null || true)
     case "$label" in *🏆*) printf '%s' "$wt"; return 0;; esac
   done < <(tmux list-panes -t "$cwin" -F '#{pane_id}')
+  # Top-★ fallback is only meaningful for comparative scoring. Independent
+  # scores come from separate calls with nothing to calibrate against, so the
+  # highest number there is not the best candidate — it is the one the judge
+  # happened to be most generous to.
+  [ "$(tmux show-options -wqv -t "$cwin" @cockpit_judge_mode 2>/dev/null || true)" = independent ] && return 0
   local s n
   while IFS=$'\t' read -r s n; do
     [ "$s" = "?" ] && continue
@@ -2487,6 +2497,7 @@ _scored_winner(){   # $1=grid window -> worktree name or ""
 _score_independent(){
   local cwin="$1" prompt="$2" timeline="$3" score_round="$4" base="$5"; shift 5
   local p wt path res rest sc reason reason_block model="" summary=""
+  tmux set-option -w -t "$cwin" @cockpit_judge_mode independent 2>/dev/null || true
   [ -n "$timeline" ] || timeline="[initial] ${prompt:-(unknown task)}"
   for p in "$@"; do
     wt=$(pane_wt "$p"); [ -n "$wt" ] || continue
@@ -2504,6 +2515,9 @@ _score_independent(){
     printf 'Instruction timeline:\n%s\n' "$timeline"
     printf 'Judge model: %s\n' "${model:-(unknown)}"
     printf 'Mode: independent fallback (comparative JSON remained invalid after one repair; diagnostic: %s)\n' "$(_judge_invalid_file)"
+    printf 'These scores are NOT comparable across candidates: each was judged alone, with no\n'
+    printf 'peer to calibrate against, and this mode has ranked the weakest candidate first.\n'
+    printf 'Use them as per-agent feedback only, and run "wtcp score --fresh" to pick a winner.\n' 
     printf 'Rubric: Task 0-4 · Grounding 0-3 · Verification 0-2 · Actionability 0-1\n\n'
     printf 'Rankings:\n%b' "$summary"
   } > "$F" 2>/dev/null || true
@@ -2619,10 +2633,15 @@ ${first_resp:-(empty response content)}
 REPAIR RESPONSE REJECTED BECAUSE: ${rubric_err:-(unknown)}
 ${resp:-(empty response content)}"
     _score_independent "$cwin" "$prompt" "$prompt_log" "$score_round" "$base" "${panes[@]}"   # couldn't parse -> per-agent fallback (re-judges, reports its own model)
-    [ "$COCKPIT_NO_INTERACTIVE_MENUS" = "1" ] || _winner_menu "$cwin"
+    # No winner menu here. Independent scores are produced one candidate at a
+    # time with no peer to calibrate against, and measurably invert the field:
+    # the round that motivated this gave the WEAKEST agent 9/10 alone and 3/10
+    # in comparison. Offering a ranked pick would dress that up as a decision.
+    tmux display-message "wtcp: independent fallback — scores are not comparable; run 'wtcp score --fresh' before merging" 2>/dev/null || true
     return 0
   fi
   winner=$(printf '%s' "$resp" | jq -r '.winner // empty' 2>/dev/null || true)
+  tmux set-option -w -t "$cwin" @cockpit_judge_mode comparative 2>/dev/null || true
 
   # Write the comparative report (jq formats the whole file).
   local F; F=$(_judge_file); mkdir -p "$(dirname "$F")"
@@ -2818,6 +2837,11 @@ cmd_merge(){
   local cwin winner; cwin=$(_cur_win)
   winner=$(_scored_winner "$cwin")
   if [ -z "$winner" ]; then
+    if [ "$(tmux show-options -wqv -t "$cwin" @cockpit_judge_mode 2>/dev/null || true)" = independent ]; then
+      tmux display-message "wtcp: independent fallback scores are not comparable — run 'wtcp score --fresh'" 2>/dev/null || true
+      die "this round only has independent fallback scores, which are not comparable across candidates.
+     Run 'wtcp score --fresh' for a comparative judgment, or 'wtcp pick <name>' to choose manually."
+    fi
     tmux display-message "wtcp: no scored winner — run 'wtcp score' first" 2>/dev/null || true
     die "no scored winner in this grid — run 'wtcp score' first, or 'wtcp pick <name>' to choose manually"
   fi
@@ -2914,6 +2938,7 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   # must outlive the grid — and the stamp must travel too, or cmd_clean would
   # later leave those session variables behind.
   local kept_env; kept_env=$(tmux show-options -wqv -t "$cwin" @cockpit_env 2>/dev/null || true)
+  local kept_mode; kept_mode=$(tmux show-options -wqv -t "$cwin" @cockpit_judge_mode 2>/dev/null || true)
   pcount=$(tmux list-panes -t "$cwin" -F x | grep -c . || true)
   if [ "$pcount" -le 1 ]; then
     # The window already holds ONLY the keeper (keep/pick pressed again in an
@@ -2934,6 +2959,7 @@ _keep_session(){   # $1=grid window  $2=keeper worktree  $3..=loser worktrees
   [ -n "$base" ]   && tmux set-option -w -t "$nwin" @cockpit_base "$base"
   [ -n "$from_wt" ] && tmux set-option -w -t "$nwin" @cockpit_from_worktree "$from_wt"
   [ -n "$kept_env" ] && tmux set-option -w -t "$nwin" @cockpit_env "$kept_env"
+  [ -n "$kept_mode" ] && tmux set-option -w -t "$nwin" @cockpit_judge_mode "$kept_mode"
   _style_window "$nwin"
   local l
   for l in "$@"; do [ -n "$l" ] && (_wm remove "$l" -f || true); done

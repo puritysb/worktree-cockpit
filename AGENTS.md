@@ -151,6 +151,16 @@ This file is the design/gotcha memory for working ON wtcp itself.
   both model responses in `~/.config/wtcp/judge-invalid.txt` before comparative
   scoring falls back to independent judging. Independent judging uses the same
   one-repair rule, so never replace strict validation with permissive parsing.
+  **The fallback never picks a winner.** Independent scores come from separate
+  calls with no peer to calibrate against and measurably invert the field: the
+  round that motivated this gave the WEAKEST candidate 9/10 alone and 3/10 in
+  comparison. `cmd_score`/`_score_independent` stamp `@cockpit_judge_mode`, and
+  `_scored_winner` refuses its top-★ fallback when that reads `independent`, so
+  `wtcp merge` stops with an explanation instead of merging confidently wrong.
+  A 🏆 still resolves (only a comparative response can stamp one), the ranking
+  is still shown as per-agent feedback, and `wtcp winner` still opens a menu —
+  relabelled MANUAL so it does not pose as the judge's ranking. The report says
+  the same thing the code enforces. Covered by `tests/test_judge_mode.sh`.
   **The retry MUST be told what failed.** `_rubric_response_normalize` explains
   every rejection on stderr (naming the offending field, the candidate for a
   comparative record, and the computed score); callers capture that text and
@@ -510,13 +520,14 @@ file), or `cmd_clean`, `_set_agent_cfg`, `_diff_base`, `_workmux_cfg_value`, or
 `_judge_error_excerpt`, `_judge_salvage_json`, `_rotate_invalid_judgments`,
 judge budgets/prompts
 (third), or popup
-send/fork input editing (fourth):
+send/fork input editing (fourth), or `_scored_winner`/`_winner_menu`/`cmd_merge` (fifth):
 
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
 bash tests/test_judge_evidence.sh    # 177 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
+bash tests/test_judge_mode.sh        # 12 assertions; fallback scores never pick a winner
 ```
 
 These tests extract functions straight out of `wtcp` with `extract_fn` (an awk range
