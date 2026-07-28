@@ -185,6 +185,11 @@ has "absolute scores precede comparison" "absolute score first; comparison secon
 has "rubric requires auditable cap IDs" "output caps array" "$RUBRIC"
 has "rubric keeps dimensions orthogonal" "Do not deduct the same underlying weakness in two dimensions" "$RUBRIC"
 has "rubric rejects comparative-only deductions" '"less detailed than the winner" is not an absolute-rubric deduction' "$RUBRIC"
+# An ID-wording guard is dodgeable by naming; the comparison lives in the prose.
+# Observed: Task 3/4 justified only as "somewhat weaker than the former one",
+# carried by the innocuous id incomplete_improvement_details.
+has "rubric requires self-contained dimension reasons" "Write every dimension_reason so it stands alone" "$RUBRIC"
+has "rubric names the dodge explicitly" "no matter how the issue ID is named" "$RUBRIC"
 has "rubric defines direct evidence narrowly" "agent-authored conclusion" "$RUBRIC"
 has "rubric makes ten exceptional" "Score 10 is exceptional" "$RUBRIC"
 has "unverified facts do not reduce task" "affects Grounding and/or Verification, not Task" "$RUBRIC"
