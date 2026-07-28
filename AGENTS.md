@@ -121,16 +121,25 @@ This file is the design/gotcha memory for working ON wtcp itself.
   orthogonality rule (Task scores the answer against the timeline, never against
   rivals) makes that the correct reading, and the fix is a judge that names the
   absolute defect. Ranking order is unaffected.
-  **An ID-wording guard is permanently dodgeable.** Three different innocuous
-  IDs have now carried a purely comparative Task deduction —
-  `missed_orphan_references`, `lack_of_concrete_evidence`,
-  `incomplete_improvement_details` — because the comparison lives in the PROSE
-  ("somewhat weaker than the former one"), not in the name. A prose check
-  cannot be deterministic: dimension_reasons are written in whatever language
-  the model inferred from the timeline. The rubric therefore also demands
-  self-contained dimension_reasons. Treat the residual as a known one-point
-  wobble on non-winning candidates; do NOT widen the ID regex, which would
-  start refunding real Task defects.
+  **An ID-wording guard is permanently dodgeable, so it is no longer the real
+  gate.** Three different innocuous IDs carried a purely comparative Task
+  deduction — `missed_orphan_references`, `lack_of_concrete_evidence`,
+  `incomplete_improvement_details` — because the comparison lives in the PROSE,
+  which is written in whatever language the model inferred. Widening the regex
+  only starts refunding real Task defects. The fix inverts the rule from a
+  deny-list to an allow-list: `enforce_task_anchor` requires any Task below 4
+  to set `task_requirement` to a VERBATIM slice (>= 6 chars, whitespace- and
+  case-normalized) of the instruction timeline, which wtcp holds. A comparative
+  verdict has no requirement to quote, so it is refunded with a note. **This is
+  deliberately precision-over-recall**: a genuine Task gap the judge fails to
+  anchor is refunded too. Measured on a live 3-candidate round, Task deductions
+  both survived (agy 3/4, quoting the instruction, with an absolute reason) and
+  were refunded (`specific_code_antipatterns_missing` — code antipatterns were
+  never requested), so the dimension does not collapse to 4. Known limit:
+  quoting the WHOLE timeline trivially satisfies the substring test; it still
+  forces the judge to point at the instruction rather than at a rival, and
+  tightening it further risks refunding short single-requirement timelines.
+  With no timeline supplied wtcp cannot verify and does not judge.
   Comparative JSON also requires
   `winner_reason`, `tie_break`, and neutral `summary`. If normalization creates
   a top-score tie after the response, `none`/`not_needed` becomes an explicit
@@ -506,7 +515,7 @@ send/fork input editing (fourth):
 ```bash
 bash tests/test_status_retile.sh     # 12 assertions; scratch tmux socket + fake HOME
 bash tests/test_workmux_coexist.sh   # 48 assertions; also a throwaway git repo
-bash tests/test_judge_evidence.sh    # 169 assertions; immutable base + rubric/evidence/repair
+bash tests/test_judge_evidence.sh    # 177 assertions; immutable base + rubric/evidence/repair
 bash tests/test_prompt_input.sh      # 10 assertions; UTF-8 editing + clean cancel
 ```
 

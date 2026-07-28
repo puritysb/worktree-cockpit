@@ -1687,8 +1687,11 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
   # Failures explain themselves on STDERR. Callers capture that text and hand it
   # to the single repair turn: a bare "schema validation failed" gave the model
   # nothing to act on and it re-emitted the identical broken response verbatim.
-  local expected="${1:-0}" expected_names="${2:-[]}"
-  jq -ce --argjson n "$expected" --argjson expected_names "$expected_names" '
+  # $3 = the instruction timeline. wtcp KNOWS what the user asked for, so a Task
+  # deduction can be required to quote the unmet requirement verbatim from it —
+  # a check that holds in any output language, unlike matching issue-ID wording.
+  local expected="${1:-0}" expected_names="${2:-[]}" timeline="${3:-}"
+  jq -ce --argjson n "$expected" --argjson expected_names "$expected_names" --arg timeline "$timeline" '
     def structurally_valid:
       (.breakdown | type == "object")
       and (.breakdown.task | type == "number" and . >= 0 and . <= 4 and floor == .)
@@ -1821,6 +1824,35 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
       and (test("(^|_)(requirement|requirements|requested|request|instruction|instructions|asked)(_|$)") | not);
     def evidence_only_task_issue:
       evidence_flavoured_task_issue or comparative_task_issue;
+    # Allow-list, not deny-list. Blocking comparative Task deductions by ID
+    # wording is permanently dodgeable — three innocuous IDs have carried one —
+    # because the comparison lives in the prose, which is written in whatever
+    # language the model inferred. Invert it: a Task deduction must QUOTE the
+    # unmet requirement out of the instruction timeline, which wtcp holds, so
+    # the check is verbatim and language-independent. A comparative verdict has
+    # no requirement to quote and is refunded. This deliberately trades recall
+    # for precision: a real Task gap the judge fails to anchor is refunded too,
+    # and every surviving Task deduction points at something the user asked for.
+    def norm_text($s): ($s // "") | ascii_downcase | gsub("[[:space:]]+"; " ") | gsub("^ +| +$"; "");
+    def task_anchor_verified:
+      ($timeline | length) == 0   # no timeline supplied: wtcp cannot verify, so it does not judge
+      or (((.task_requirement // "") | norm_text(.)) as $needle
+          # Bind the needle before piping: inside contains() the input is
+          # already the normalized timeline string, so .task_requirement there
+          # would index a string.
+          | ($needle | length) >= 6 and (norm_text($timeline) | contains($needle)));
+    def enforce_task_anchor:
+      .dimension_issue_ids.task as $id
+      | if .breakdown.task >= 4 or cap_derived_issue($id) or task_anchor_verified then .
+        else .breakdown.task = 4
+          | .dimension_issue_ids.task = "none"
+          | .dimension_reasons.task = "(Task deduction refunded by wtcp - see Adjustments)"
+          | .normalization_notes += [
+              ("Refunded the Task deduction [" + $id
+                + "]: it did not quote an unmet requirement from the instruction timeline, "
+                + "so it cannot be distinguished from a comparative verdict.")
+            ]
+        end;
     def normalize_task_semantics:
       .normalization_notes = (.normalization_notes // [])
       | .dimension_issue_ids.task as $id
@@ -1905,6 +1937,7 @@ _rubric_response_normalize(){   # stdin=response; $1=ranking count (0=single) $2
       .breakdown as $raw_breakdown
       | ._raw_breakdown = $raw_breakdown
       | normalize_task_semantics
+      | enforce_task_anchor
       | if .evidence_level == "mixed" and (hascap("mixed_primary_evidence") | not)
         then .caps += ["mixed_primary_evidence"]
       elif .evidence_level == "narrative_only" and (hascap("narrative_only_evidence") | not)
@@ -2212,9 +2245,9 @@ EOF
   _judge_rubric
   cat <<'EOF'
 Base your judgment only on the evidence shown. Return STRICT JSON only:
-{"breakdown":{"task":0,"grounding":0,"verification":0,"actionability":0},"evidence_level":"direct|mixed|narrative_only","dimension_reasons":{"task":"one concise sentence","grounding":"one concise sentence","verification":"one concise sentence","actionability":"one concise sentence"},"dimension_issue_ids":{"task":"none|unique_snake_case_issue","grounding":"none|unique_snake_case_issue","verification":"none|unique_snake_case_issue","actionability":"none|unique_snake_case_issue"},"caps":[],"strength":"one concise sentence","deduction":"one concise sentence or None","improve_dimension":"task|grounding|verification|actionability|none","improve":"one concrete improvement sentence or None"}
+{"breakdown":{"task":0,"grounding":0,"verification":0,"actionability":0},"evidence_level":"direct|mixed|narrative_only","dimension_reasons":{"task":"one concise sentence","grounding":"one concise sentence","verification":"one concise sentence","actionability":"one concise sentence"},"dimension_issue_ids":{"task":"none|unique_snake_case_issue","grounding":"none|unique_snake_case_issue","verification":"none|unique_snake_case_issue","actionability":"none|unique_snake_case_issue"},"caps":[],"strength":"one concise sentence","deduction":"one concise sentence or None","improve_dimension":"task|grounding|verification|actionability|none","improve":"one concrete improvement sentence or None","task_requirement":"verbatim quote from the instruction timeline, required only when task < 4"}
 
-The four breakdown values must be integers in their stated ranges. Do not include score; wtcp computes it from the breakdown, evidence_level, and declared hard caps. Every below-maximum dimension must have its own absolute-rubric justification in dimension_reasons and a unique lowercase snake_case dimension_issue_id; a maximum dimension must use issue ID none. Reusing an issue ID across deducted dimensions is forbidden because it double-charges one weakness. For Task specifically, the issue ID must name an actual missing/incorrect requirement or core answer defect. An issue ID containing unverified, unsupported, evidence, grounding, verification, citation, narrative, comparative, less_detailed, or fewer_details is invalid for Task, as is an omission-relative ID such as missed_x, overlooked_x, not_identified_x, or failed_to_identify_x unless it names an item the instruction timeline requested: put that concern in Grounding/Verification and keep Task at 4 unless it causes a concrete wrong answer or missing requested part. If the computed score is below 10, deduction must not be "None", improve_dimension must name ONE dimension that is actually below its maximum after the evidence limits/caps, and improve must explain how to recover that dimension. Never target a full-credit dimension. For a computed 10, use deduction "None", improve_dimension none, and improve "None". Follow the Output language rule exactly; keep JSON keys in English and all explanation values concise.
+The four breakdown values must be integers in their stated ranges. Do not include score; wtcp computes it from the breakdown, evidence_level, and declared hard caps. Every below-maximum dimension must have its own absolute-rubric justification in dimension_reasons and a unique lowercase snake_case dimension_issue_id; a maximum dimension must use issue ID none. Reusing an issue ID across deducted dimensions is forbidden because it double-charges one weakness. For Task specifically, the issue ID must name an actual missing/incorrect requirement or core answer defect. A Task below 4 must also set task_requirement to a VERBATIM slice of the instruction timeline (at least 6 characters) naming what went unmet; wtcp refunds any Task deduction it cannot match against the timeline, because a deduction with nothing to quote is indistinguishable from "weaker than the other candidate". An issue ID containing unverified, unsupported, evidence, grounding, verification, citation, narrative, comparative, less_detailed, or fewer_details is invalid for Task, as is an omission-relative ID such as missed_x, overlooked_x, not_identified_x, or failed_to_identify_x unless it names an item the instruction timeline requested: put that concern in Grounding/Verification and keep Task at 4 unless it causes a concrete wrong answer or missing requested part. If the computed score is below 10, deduction must not be "None", improve_dimension must name ONE dimension that is actually below its maximum after the evidence limits/caps, and improve must explain how to recover that dimension. Never target a full-credit dimension. For a computed 10, use deduction "None", improve_dimension none, and improve "None". Follow the Output language rule exactly; keep JSON keys in English and all explanation values concise.
 EOF
 }
 
@@ -2244,20 +2277,21 @@ EOF
 Rank head-to-head on whether the reported problem is actually solved and every explicit requirement is met — not on code style, refactor cleanliness, verbosity, or effort shown. Do not reward or penalize language choice unless the instruction timeline requires a specific language.
 
 Use only the evidence shown. Return STRICT JSON only, no prose:
-{"rankings":[{"name":"<exact agent name>","breakdown":{"task":0,"grounding":0,"verification":0,"actionability":0},"evidence_level":"direct|mixed|narrative_only","dimension_reasons":{"task":"one concise sentence","grounding":"one concise sentence","verification":"one concise sentence","actionability":"one concise sentence"},"dimension_issue_ids":{"task":"none|unique_snake_case_issue","grounding":"none|unique_snake_case_issue","verification":"none|unique_snake_case_issue","actionability":"none|unique_snake_case_issue"},"caps":[],"strength":"one concise sentence","deduction":"one concise sentence or None","improve_dimension":"task|grounding|verification|actionability|none","improve":"one concrete improvement sentence or None"}],"winner":"<exact name>","winner_reason":"why this top-scoring candidate wins","tie_break":"substantive reason for an apparent tie, otherwise not_needed","summary":"concise overall comparison without generalizing a candidate-specific weakness"}
+{"rankings":[{"name":"<exact agent name>","breakdown":{"task":0,"grounding":0,"verification":0,"actionability":0},"evidence_level":"direct|mixed|narrative_only","dimension_reasons":{"task":"one concise sentence","grounding":"one concise sentence","verification":"one concise sentence","actionability":"one concise sentence"},"dimension_issue_ids":{"task":"none|unique_snake_case_issue","grounding":"none|unique_snake_case_issue","verification":"none|unique_snake_case_issue","actionability":"none|unique_snake_case_issue"},"caps":[],"strength":"one concise sentence","deduction":"one concise sentence or None","improve_dimension":"task|grounding|verification|actionability|none","improve":"one concrete improvement sentence or None","task_requirement":"verbatim quote from the instruction timeline, required only when task < 4"}],"winner":"<exact name>","winner_reason":"why this top-scoring candidate wins","tie_break":"substantive reason for an apparent tie, otherwise not_needed","summary":"concise overall comparison without generalizing a candidate-specific weakness"}
 
-Include EVERY agent in rankings, best first, name copied EXACTLY. Every breakdown must use integers in the stated ranges. Do not include score; wtcp computes it from the breakdown, evidence_level, and declared hard caps. Every below-maximum dimension must have its own absolute-rubric justification in dimension_reasons and a unique lowercase snake_case dimension_issue_id; a maximum dimension should use issue ID none. Reusing an issue ID across genuinely deducted dimensions is forbidden because it double-charges one weakness. For Task specifically, the issue ID must name an actual missing/incorrect requirement or core answer defect. An issue ID containing unverified, unsupported, evidence, grounding, verification, citation, narrative, comparative, less_detailed, or fewer_details is invalid for Task, as is an omission-relative ID such as missed_x, overlooked_x, not_identified_x, or failed_to_identify_x unless it names an item the instruction timeline requested: put that concern in Grounding/Verification and keep Task at 4 unless it causes a concrete wrong answer or missing requested part. wtcp clears IDs for dimensions that normalize to full credit and namespaces shared hard-cap IDs by dimension. If the computed score is below 10, deduction must not be "None", improve_dimension must name ONE dimension that is actually below its maximum after evidence limits/caps, and improve must explain how to recover that dimension; never target a full-credit dimension. For a computed 10 use deduction/improve "None" and improve_dimension none. The winner must have a top absolute score; do not lower another candidate merely to avoid a tie. Give a substantive tie_break for an apparent tie, otherwise use not_needed; if wtcp creates a tie while applying evidence limits/caps, it replaces not_needed with an explicit judge-preference note. winner_reason must explain the selection consistently with the scores. summary should differ from winner_reason and compare the field without attributing one candidate's weakness to all candidates; an exact duplicate is omitted from the report. Follow the Output language rule exactly; keep JSON keys in English and every explanation concise.
+Include EVERY agent in rankings, best first, name copied EXACTLY. Every breakdown must use integers in the stated ranges. Do not include score; wtcp computes it from the breakdown, evidence_level, and declared hard caps. Every below-maximum dimension must have its own absolute-rubric justification in dimension_reasons and a unique lowercase snake_case dimension_issue_id; a maximum dimension should use issue ID none. Reusing an issue ID across genuinely deducted dimensions is forbidden because it double-charges one weakness. For Task specifically, the issue ID must name an actual missing/incorrect requirement or core answer defect. A Task below 4 must also set task_requirement to a VERBATIM slice of the instruction timeline (at least 6 characters) naming what went unmet; wtcp refunds any Task deduction it cannot match against the timeline, because a deduction with nothing to quote is indistinguishable from "weaker than the other candidate". An issue ID containing unverified, unsupported, evidence, grounding, verification, citation, narrative, comparative, less_detailed, or fewer_details is invalid for Task, as is an omission-relative ID such as missed_x, overlooked_x, not_identified_x, or failed_to_identify_x unless it names an item the instruction timeline requested: put that concern in Grounding/Verification and keep Task at 4 unless it causes a concrete wrong answer or missing requested part. wtcp clears IDs for dimensions that normalize to full credit and namespaces shared hard-cap IDs by dimension. If the computed score is below 10, deduction must not be "None", improve_dimension must name ONE dimension that is actually below its maximum after evidence limits/caps, and improve must explain how to recover that dimension; never target a full-credit dimension. For a computed 10 use deduction/improve "None" and improve_dimension none. The winner must have a top absolute score; do not lower another candidate merely to avoid a tie. Give a substantive tie_break for an apparent tie, otherwise use not_needed; if wtcp creates a tie while applying evidence limits/caps, it replaces not_needed with an explicit judge-preference note. winner_reason must explain the selection consistently with the scores. summary should differ from winner_reason and compare the field without attributing one candidate's weakness to all candidates; an exact duplicate is omitted from the report. Follow the Output language rule exactly; keep JSON keys in English and every explanation concise.
 EOF
 }
 
 _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $6=base ref -> "score|reason|model"
   local path="$1" prompt="$2" timeline="$3" score_round="$4" pane="$5" base="${6:-}" diff out claims req raw resp model score reason instr lang_rule rubric_line caps_line evidence_line dimension_lines adjustments_line
   local diff_chars combined_budget out_budget claim_chars max_tokens repair_req repaired_model first_resp normalized
-  local rubric_errf rubric_err="" first_err="" salvaged="" salvage_n=0 salvage_names="[]"
+  local rubric_errf rubric_err="" first_err="" salvaged="" salvage_n=0 salvage_names="[]" salvage_timeline=""
   rubric_errf=$(mktemp "${TMPDIR:-/tmp}/wtcp-rubric.XXXXXX") || rubric_errf="${TMPDIR:-/tmp}/wtcp-rubric.$$"
   local jhdr=(); [ -n "${COCKPIT_JUDGE_AUTH:-}" ] && jhdr+=(-H "Authorization: $COCKPIT_JUDGE_AUTH")
   [ -n "$path" ] && diff=$(_wt_diff "$path" "$base") || diff=""
   [ -n "$timeline" ] || timeline="[initial] ${prompt:-(unknown task)}"
+  salvage_timeline="$timeline"
   # Diff and terminal are one evidence pool. Analysis rounds with no changes
   # return the unused diff allocation to the terminal instead of wasting half
   # the context while truncating the actual deliverable.
@@ -2281,7 +2315,7 @@ _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $
   raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$req" 2>/dev/null || true)
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
   resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
-  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize 0 2>"$rubric_errf"); then
+  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize 0 "[]" "$timeline" 2>"$rubric_errf"); then
     resp="$normalized"
   else
     first_resp="$resp"
@@ -2291,7 +2325,7 @@ _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $
     # recurring brace/duplicate-key breaks survive being pointed out.
     salvaged=$(printf '%s' "$resp" | _judge_salvage_json 2>/dev/null || true)
     [ -n "$salvaged" ] && resp="$salvaged"
-    if ! printf '%s' "$resp" | _rubric_response_valid "$salvage_n" "$salvage_names"; then
+    if ! printf '%s' "$resp" | _rubric_response_valid "$salvage_n" "$salvage_names" "$salvage_timeline"; then
       first_err=$(_judge_rejection_detail "$first_resp" "$first_err")
       repair_req=$(printf '%s' "$req" | _judge_repair_request "$first_resp" "$max_tokens" "$first_err")
       raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
@@ -2300,7 +2334,7 @@ _judge_one(){   # $1=path $2=task prompt $3=timeline $4=score round $5=pane_id $
       resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
     fi
   fi
-  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize 0 2>"$rubric_errf"); then
+  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize 0 "[]" "$timeline" 2>"$rubric_errf"); then
     resp="$normalized"
     rm -f "$rubric_errf"
     score=$(printf '%s' "$resp" | jq -r '.score' 2>/dev/null)
@@ -2550,11 +2584,11 @@ cmd_score(){
   model=$(printf '%s' "$raw" | jq -r '.model // empty' 2>/dev/null || true)
   resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
 
-  local winner expected_names rubric_errf rubric_err="" first_err="" salvaged="" salvage_n salvage_names
+  local winner expected_names rubric_errf rubric_err="" first_err="" salvaged="" salvage_n salvage_names salvage_timeline
   rubric_errf=$(mktemp "${TMPDIR:-/tmp}/wtcp-rubric.XXXXXX") || rubric_errf="${TMPDIR:-/tmp}/wtcp-rubric.$$"
   expected_names=$(printf '%s\n' "${names[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
-  salvage_n="$nag"; salvage_names="$expected_names"
-  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize "$nag" "$expected_names" 2>"$rubric_errf"); then
+  salvage_n="$nag"; salvage_names="$expected_names"; salvage_timeline="$prompt_log"
+  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize "$nag" "$expected_names" "$prompt_log" 2>"$rubric_errf"); then
     resp="$normalized"
   else
     first_resp="$resp"
@@ -2564,7 +2598,7 @@ cmd_score(){
     # recurring brace/duplicate-key breaks survive being pointed out.
     salvaged=$(printf '%s' "$resp" | _judge_salvage_json 2>/dev/null || true)
     [ -n "$salvaged" ] && resp="$salvaged"
-    if ! printf '%s' "$resp" | _rubric_response_valid "$salvage_n" "$salvage_names"; then
+    if ! printf '%s' "$resp" | _rubric_response_valid "$salvage_n" "$salvage_names" "$salvage_timeline"; then
       first_err=$(_judge_rejection_detail "$first_resp" "$first_err")
       repair_req=$(printf '%s' "$req" | _judge_repair_request "$first_resp" "$max_tokens" "$first_err")
       raw=$(curl -s --max-time "$COCKPIT_JUDGE_TIMEOUT" "$COCKPIT_JUDGE_URL" -H 'Content-Type: application/json' ${jhdr[@]+"${jhdr[@]}"} -d "$repair_req" 2>/dev/null || true)
@@ -2573,7 +2607,7 @@ cmd_score(){
       resp=$(printf '%s' "$raw" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
     fi
   fi
-  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize "$nag" "$expected_names" 2>"$rubric_errf"); then
+  if normalized=$(printf '%s' "$resp" | _rubric_response_normalize "$nag" "$expected_names" "$prompt_log" 2>"$rubric_errf"); then
     resp="$normalized"
     rm -f "$rubric_errf"
   else

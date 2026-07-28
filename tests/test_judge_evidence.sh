@@ -426,6 +426,43 @@ has "invalid response log preserves repair response" "bad two" "$INVALID_LOG"
 has "fallback report exposes diagnostic path" "Mode: independent fallback" "$(<"$WTCOP")"
 has "fallback respects noninteractive menu setting" '[ "$COCKPIT_NO_INTERACTIVE_MENUS" = "1" ] || _winner_menu "$cwin"' "$(<"$WTCOP")"
 
+echo "T11: a Task deduction must quote the instruction it says went unmet"
+# Blocking comparative Task deductions by issue-ID wording is permanently
+# dodgeable — three innocuous IDs carried one — because the comparison lives in
+# the prose, written in whatever language the model inferred. wtcp holds the
+# timeline, so require the deduction to quote it verbatim instead: that check
+# works in any language. Deliberately trades recall for precision.
+TIMELINE='[initial] 현재 테스트 셋이 의미있는 것들로 잘 구성되어 있는지, 보완할 부분은 무엇인지 조사한다'
+anchor_case(){ # $1=issue id  $2=task_requirement ("" = none)  $3=timeline -> resulting task score
+  jq -nc --arg id "$1" --arg req "$2" '{breakdown:{task:3,grounding:2,verification:1,actionability:1},
+    evidence_level:"direct",
+    dimension_reasons:{task:"t",grounding:"g",verification:"v",actionability:"a"},
+    dimension_issue_ids:{task:$id,grounding:"gg",verification:"vv",actionability:"none"},
+    caps:[],strength:"s",deduction:"d",improve_dimension:"task",improve:"i"}
+    + (if $req == "" then {} else {task_requirement:$req} end)' \
+  | _rubric_response_normalize 0 "[]" "$3" | jq -r '.breakdown.task'
+}
+is_task(){ [ "$2" = "$3" ] && pass "$1" || fail "$1 (task=$2, want $3)"; }
+is_task "an unquoted Task deduction is refunded whatever its ID is called" \
+  "$(anchor_case incomplete_improvement_details "" "$TIMELINE")" 4
+is_task "a deduction quoting the timeline verbatim survives" \
+  "$(anchor_case missing_improvement_analysis "보완할 부분은 무엇인지" "$TIMELINE")" 3
+is_task "a quote absent from the timeline is refunded" \
+  "$(anchor_case missing_benchmark "성능 벤치마크를 측정하라" "$TIMELINE")" 4
+is_task "a too-short quote cannot game the anchor" \
+  "$(anchor_case missing_x "조사" "$TIMELINE")" 4
+is_task "with no timeline wtcp does not judge the anchor" \
+  "$(anchor_case incomplete_improvement_details "" "")" 3
+REFUNDED=$(jq -nc '{breakdown:{task:3,grounding:2,verification:1,actionability:1},evidence_level:"direct",
+  dimension_reasons:{task:"t",grounding:"g",verification:"v",actionability:"a"},
+  dimension_issue_ids:{task:"incomplete_improvement_details",grounding:"gg",verification:"vv",actionability:"none"},
+  caps:[],strength:"s",deduction:"d",improve_dimension:"task",improve:"i"}' \
+  | _rubric_response_normalize 0 "[]" "$TIMELINE")
+has "the refund explains itself" "did not quote an unmet requirement" \
+  "$(printf '%s' "$REFUNDED" | jq -r '.normalization_notes | join(" ")')"
+has "both schemas offer the anchor field" '"task_requirement":"verbatim quote' "$(<"$WTCOP")"
+has "the rules explain when it is required" "VERBATIM slice of the instruction timeline" "$(<"$WTCOP")"
+
 echo "T10: path claims are resolved against the worktree"
 # With no diff, the manifest (top-level entries only) can never confirm a claim
 # about a nested file, so every competent candidate had to be graded "mixed" and
